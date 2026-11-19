@@ -104,6 +104,8 @@ export class VehicleSpeedEstimator {
     gyroOffsetX: number;
     gyroOffsetY: number;
     distanceCalibrationFactor?: number;
+    /** Velocidad propia del teléfono leída por GPS en Modo Dashcam (km/h) */
+    egoGpsSpeedKmh?: number;
   }): VehicleKinematicReading {
     const {
       trackId,
@@ -117,6 +119,7 @@ export class VehicleSpeedEstimator {
       gyroOffsetX,
       gyroOffsetY,
       distanceCalibrationFactor = 1.0,
+      egoGpsSpeedKmh = 0,
     } = params;
 
     const normalizedName = className.toLowerCase();
@@ -196,7 +199,14 @@ export class VehicleSpeedEstimator {
       speedPxPerSec = cleanDispPx / dtWindowSec;
 
       const speedMetersPerSec = speedPxPerSec / Math.max(4.0, record.emaPixelsPerMeter);
-      instantKmh = Math.min(220, Math.max(0, speedMetersPerSec * 3.6));
+      const rawRelativeKmh = Math.min(220, Math.max(0, speedMetersPerSec * 3.6));
+
+      // Compensación Modo Dashcam GPS: restar la velocidad propia del vehículo medida por GPS
+      const safeEgoKmh = Math.max(0, egoGpsSpeedKmh);
+      instantKmh =
+        safeEgoKmh > 0.5
+          ? Math.min(220, Math.max(0, Math.abs(rawRelativeKmh - safeEgoKmh)))
+          : rawRelativeKmh;
     }
 
     // 3. Filtro EMA sobre ventana de 500 ms: alpha = 1 - exp(-dt / 500ms)

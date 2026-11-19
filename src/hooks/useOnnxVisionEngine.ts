@@ -25,6 +25,13 @@ import {
   TrafficCountBreakdown,
 } from '../utils/VirtualCountingLine';
 import { InertialARState } from './useInertialARTracker';
+import { globalEvidenceManager } from '../modules/EvidenceAndReportsModule';
+import { globalSpatialZonesROI } from '../modules/SpatialZonesROI';
+import {
+  globalHumanSafetyAnalytics,
+  ProximityHazardLink,
+} from '../modules/HumanSafetyAnalytics';
+import { globalMobileAssistantSuite } from '../modules/MobileAssistantSuite';
 
 export type OnnxExecutionProvider = 'webgpu' | 'wasm' | 'webgl';
 
@@ -74,7 +81,7 @@ export interface OnnxTrackedDetection {
   speedPxPerSec: number;
   /** Velocidad relativa estimada en m/s */
   speedMetersPerSec: number;
-  /** Velocidad cinemática compensada en km/h (VehicleSpeedEstimator) */
+  /** Velocidad cinemática compensada en km/h (VehicleSpeedEstimator + GPS Dashcam) */
   speedKmh: number;
   /** Clasificación con histéresis: 'DETENIDO' (<3.5 km/h por >600ms) vs 'EN MOVIMIENTO' (>4.5 km/h) */
   motionStatus: VehicleMotionStatus;
@@ -84,6 +91,20 @@ export interface OnnxTrackedDetection {
   hasCrossedLine: boolean;
   /** Dirección del cruce en la Línea Virtual ('ENTRADA' | 'SALIDA' | null) */
   crossingDirection: CrossingDirection | null;
+  /** Indica si el centroide del vehículo está dentro del Polígono ROI */
+  insideRoi?: boolean;
+  /** Segundos acumulados detenido dentro del Polígono ROI */
+  roiDwellSeconds?: number;
+  /** Indica si el vehículo violó el tiempo máximo de detención en zona prohibida ROI */
+  isRoiViolation?: boolean;
+  /** Texto alfanumérico de matrícula leído por ALPR (tesseract.js Web Worker) */
+  licensePlate?: string | null;
+  /** Indica si se detectó posible caída por biomecánica de 17 keypoints (>2.5s horizontal inmóvil) */
+  isFallDetected?: boolean;
+  /** Segundos acumulados en postura horizontal inmóvil */
+  fallDurationSeconds?: number;
+  /** Indica si el peatón o vehículo se encuentra en zona de riesgo de colisión */
+  hasProximityRisk?: boolean;
   age: number;
   lostFrames: number;
   keypoints: OnnxKeypoint2D[];
@@ -108,6 +129,15 @@ export interface OnnxTrafficLiveTelemetry {
   activeOverspeedInView: number;
   activeBanner: OverspeedBannerAlert | null;
   countingStats: TrafficCountBreakdown;
+  roiViolationsCount: number;
+  activeRoiViolationInView: boolean;
+  fallAlertsCount: number;
+  activeFallInView: boolean;
+  proximityAlertsCount: number;
+  proximityLinks: ProximityHazardLink[];
+  egoGpsSpeedKmh: number;
+  gpsCoordsText: string;
+  evidencesCount: number;
 }
 
 export interface OnnxVisionTimings {
@@ -150,6 +180,22 @@ export interface UseOnnxVisionEngineOptions {
   distanceCalibrationFactor: number;
   /** Habilita el conteo geométrico en la Línea Virtual de Aforo */
   showCountingLine: boolean;
+  /** Captura automática de foto-multa AR en memoria + IndexedDB */
+  enableAutoEvidence?: boolean;
+  /** Límite circular de evidencias almacenadas (10..100, por defecto 50) */
+  maxEvidenceRecords?: number;
+  /** Activa Polígono ROI de 4 vértices (Zona de Exclusión / Estacionamiento Prohibido) */
+  enableRoiPolygon?: boolean;
+  /** Segundos detenido en Polígono ROI antes de disparar alerta (3..30s, por defecto 10s) */
+  roiDwellThresholdSeconds?: number;
+  /** Lectura opcional de placas ALPR con tesseract.js en Web Worker */
+  enableAlpr?: boolean;
+  /** Análisis biomecánico de caídas por keypoints y riesgo de colisión peatón-vehículo */
+  enableHumanSafety?: boolean;
+  /** Asistente de voz en tiempo real (Web Speech API es-ES / es-MX) */
+  enableVoiceAssistant?: boolean;
+  /** Modo Dashcam con compensación de velocidad propia por GPS */
+  enableDashcamGps?: boolean;
   /** Referencia de estado inercial (useInertialARTracker) para restar movimiento de mano */
   inertialStateRef?: React.MutableRefObject<InertialARState>;
   /** Ruta al modelo YOLO11n/YOLOv8n (.onnx). Por defecto: '/models/yolo11n.onnx' */
@@ -562,6 +608,14 @@ export function useOnnxVisionEngine({
   enableSpeedSoundAlert,
   distanceCalibrationFactor,
   showCountingLine,
+  enableAutoEvidence = true,
+  maxEvidenceRecords = 50,
+  enableRoiPolygon = false,
+  roiDwellThresholdSeconds = 10,
+  enableAlpr = false,
+  enableHumanSafety = true,
+  enableVoiceAssistant = true,
+  enableDashcamGps = false,
   inertialStateRef,
   onnxDetectorUrl = '/models/yolo11n.onnx',
   onnxPoseUrl = '/models/yolo11n-pose.onnx',
@@ -593,6 +647,15 @@ export function useOnnxVisionEngine({
     activeOverspeedInView: 0,
     activeBanner: null,
     countingStats: globalVirtualCountingLine.getStats(),
+    roiViolationsCount: 0,
+    activeRoiViolationInView: false,
+    fallAlertsCount: 0,
+    activeFallInView: false,
+    proximityAlertsCount: 0,
+    proximityLinks: [],
+    egoGpsSpeedKmh: 0,
+    gpsCoordsText: '',
+    evidencesCount: globalEvidenceManager.getEvidences().length,
   }));
   const [timings, setTimings] = useState<OnnxVisionTimings>({
     captureMs: 0.9,
@@ -644,6 +707,14 @@ export function useOnnxVisionEngine({
     fps: 30.0,
   });
 
+  useEffect(() => {
+    globalEvidenceManager.setMaxRecords(maxEvidenceRecords);
+  }, [maxEvidenceRecords]);
+
+  useEffect(() => {
+    globalMobileAssistantSuite.setDashcamGpsEnabled(enableDashcamGps);
+  }, [enableDashcamGps]);
+
   const optionsRef = useRef({
     isFrontCamera,
     screenWidth,
@@ -657,6 +728,14 @@ export function useOnnxVisionEngine({
     enableSpeedSoundAlert,
     distanceCalibrationFactor,
     showCountingLine,
+    enableAutoEvidence,
+    maxEvidenceRecords,
+    enableRoiPolygon,
+    roiDwellThresholdSeconds,
+    enableAlpr,
+    enableHumanSafety,
+    enableVoiceAssistant,
+    enableDashcamGps,
     inertialStateRef,
     onNewInferenceFrame,
   });
@@ -673,6 +752,14 @@ export function useOnnxVisionEngine({
     enableSpeedSoundAlert,
     distanceCalibrationFactor,
     showCountingLine,
+    enableAutoEvidence,
+    maxEvidenceRecords,
+    enableRoiPolygon,
+    roiDwellThresholdSeconds,
+    enableAlpr,
+    enableHumanSafety,
+    enableVoiceAssistant,
+    enableDashcamGps,
     inertialStateRef,
     onNewInferenceFrame,
   };
@@ -680,6 +767,8 @@ export function useOnnxVisionEngine({
   const resetTrafficCounts = useCallback(() => {
     const cleanStats = globalVirtualCountingLine.resetCounts();
     globalSpeedAlertSystem.resetCounts();
+    globalSpatialZonesROI.resetStats();
+    globalHumanSafetyAnalytics.resetStats();
     speedEstimatorRef.current.reset();
     setTrafficTelemetry((prev) => ({
       ...prev,
@@ -687,6 +776,12 @@ export function useOnnxVisionEngine({
       activeOverspeedInView: 0,
       activeBanner: null,
       countingStats: cleanStats,
+      roiViolationsCount: 0,
+      activeRoiViolationInView: false,
+      fallAlertsCount: 0,
+      activeFallInView: false,
+      proximityAlertsCount: 0,
+      proximityLinks: [],
     }));
   }, []);
 
@@ -997,6 +1092,13 @@ export function useOnnxVisionEngine({
         enableSpeedSoundAlert: soundAlertOn,
         distanceCalibrationFactor: distCalib,
         showCountingLine: countingLineActive,
+        enableAutoEvidence: autoEvidenceOn,
+        enableRoiPolygon: roiPolygonOn,
+        roiDwellThresholdSeconds: roiThresholdSec,
+        enableAlpr: alprOn,
+        enableHumanSafety: humanSafetyOn,
+        enableVoiceAssistant: voiceOn,
+        enableDashcamGps: dashcamGpsOn,
         inertialStateRef: imuRef,
         onNewInferenceFrame: onNewFrame,
       } = optionsRef.current;
@@ -1163,7 +1265,7 @@ export function useOnnxVisionEngine({
             }
           }
 
-          // 5. ByteTrack + VehicleSpeedEstimator (km/h & DETENIDO/EN MOVIMIENTO) + SpeedAlertSystem + VirtualCountingLine
+          // 5. ByteTrack + VehicleSpeedEstimator (km/h & DETENIDO/EN MOVIMIENTO) + SpeedAlertSystem + VirtualCountingLine + Módulos Empresariales
           const prevTracks = tracksRef.current;
           const matchedPrevIndices = new Set<number>();
           const updatedTracks: OnnxTrackedDetection[] = [];
@@ -1171,6 +1273,14 @@ export function useOnnxVisionEngine({
 
           const gyroOffsetX = imuRef?.current.offsetX ?? 0;
           const gyroOffsetY = imuRef?.current.offsetY ?? 0;
+
+          // Velocidad propia del teléfono (Modo Dashcam GPS)
+          const gpsSnapshot = globalMobileAssistantSuite.getGpsState();
+          const egoGpsSpeedKmh = dashcamGpsOn && gpsSnapshot.enabled ? gpsSnapshot.egoSpeedKmh : 0;
+          const gpsCoordsText =
+            dashcamGpsOn && gpsSnapshot.formattedCoords
+              ? gpsSnapshot.formattedCoords
+              : 'LOCAL EDGE';
 
           for (let i = 0; i < nmsKept.length; i++) {
             const det = nmsKept[i];
@@ -1213,7 +1323,7 @@ export function useOnnxVisionEngine({
               nextTrail = [{ x: cx, y: cy, timestampMs: t2 }];
             }
 
-            // A) Calcular velocidad en km/h y estado (DETENIDO vs EN MOVIMIENTO) con compensación inercial
+            // A) Calcular velocidad en km/h y estado (DETENIDO vs EN MOVIMIENTO) con compensación inercial + GPS Dashcam
             const kinematics = speedEstimatorRef.current.updateTrack({
               trackId,
               classId: det.classId,
@@ -1226,6 +1336,7 @@ export function useOnnxVisionEngine({
               gyroOffsetX,
               gyroOffsetY,
               distanceCalibrationFactor: distCalib,
+              egoGpsSpeedKmh,
             });
 
             // B) Evaluar Alerta Visual y Sonora de Exceso de Velocidad (SpeedAlertSystem)
@@ -1254,7 +1365,184 @@ export function useOnnxVisionEngine({
                 })
               : { hasCrossed: false, direction: null };
 
+            // D) Evaluar Polígono ROI de 4 vértices (Zona de Exclusión / Estacionamiento Prohibido)
+            const roiEval = kinematics.isVehicle
+              ? globalSpatialZonesROI.evaluateVehicleInRoi({
+                  enabled: Boolean(roiPolygonOn),
+                  trackId,
+                  centerX: cx,
+                  centerY: cy,
+                  motionStatus: kinematics.status,
+                  screenWidth: sw,
+                  screenHeight: sh,
+                  dwellThresholdSeconds: roiThresholdSec ?? 10,
+                  nowMs: t2,
+                })
+              : {
+                  insideRoi: false,
+                  dwellSeconds: 0,
+                  isViolation: false,
+                  justTriggeredViolation: false,
+                };
+
+            // E) Lectura opcional de Matrícula ALPR en Web Worker (tesseract.js) sin bloquear inferencia
+            if (kinematics.isVehicle && alprOn) {
+              globalSpatialZonesROI.maybeScheduleAlprScan({
+                enableAlpr: true,
+                videoElement,
+                screenWidth: sw,
+                screenHeight: sh,
+                isFrontCamera: mirrorX,
+                trackId,
+                screenBox: det.screenBox,
+                motionStatus: kinematics.status,
+                nowMs: t2,
+                onPlateRecognized: (recognizedTrackId, plateText) => {
+                  globalEvidenceManager.attachLicensePlateToTrackEvidences(
+                    recognizedTrackId,
+                    plateText
+                  );
+                },
+              });
+            }
+            const licensePlate = globalSpatialZonesROI.getLicensePlate(trackId);
+
+            // F) Esqueleto de 17 Keypoints y Detección Biomecánica de Caídas (HumanSafetyAnalytics)
             const headBias = Math.max(-0.5, Math.min(0.5, vx * 0.05));
+            const personKeypoints =
+              !vehiclesOnly &&
+              (det.keypoints ??
+                (poseOn && det.classId === 0
+                  ? estimatePerson17KeypointsFromROI(det.screenBox, vx, nowSec, headBias)
+                  : [])) ||
+              [];
+
+            const fallEval =
+              !vehiclesOnly && det.classId === 0
+                ? globalHumanSafetyAnalytics.evaluatePersonFall({
+                    enabled: Boolean(humanSafetyOn),
+                    trackId,
+                    screenBox: det.screenBox,
+                    keypoints: personKeypoints,
+                    speedPxPerSec: kinematics.speedPxPerSec,
+                    nowMs: t2,
+                  })
+                : {
+                    isHorizontalPosture: false,
+                    isFallDetected: false,
+                    fallDurationSeconds: 0,
+                    justTriggeredFall: false,
+                  };
+
+            // G) Disparar Asistente de Voz (Web Speech API) y Captura Automática de Evidencia (Photo-Multa AR)
+            let alertLabel = 'NORMAL';
+
+            if (isOverspeed) {
+              alertLabel = `EXCESO_${Math.round(kinematics.speedKmh)}KMH`;
+              globalMobileAssistantSuite.speakAlert({
+                enabled: Boolean(voiceOn),
+                category: 'OVERSPEED',
+                message: `Alerta, vehículo a ${Math.round(kinematics.speedKmh)} kilómetros por hora`,
+                priority: 'HIGH',
+                nowMs: t2,
+              });
+              if (autoEvidenceOn) {
+                globalEvidenceManager.captureAutomaticEvidence({
+                  videoElement,
+                  screenWidth: sw,
+                  screenHeight: sh,
+                  isFrontCamera: mirrorX,
+                  trackId,
+                  className: det.className,
+                  screenBox: det.screenBox,
+                  speedKmh: kinematics.speedKmh,
+                  speedLimitKmh: limitKmh,
+                  eventType: 'EXCESO_VELOCIDAD',
+                  licensePlate,
+                  gpsCoordsText,
+                  nowMs: t2,
+                });
+              }
+            }
+
+            if (roiEval.isViolation) {
+              alertLabel = `INVASION_ROI_${roiEval.dwellSeconds}S`;
+              if (roiEval.justTriggeredViolation) {
+                globalMobileAssistantSuite.speakAlert({
+                  enabled: Boolean(voiceOn),
+                  category: 'ROI_VIOLATION',
+                  message: 'Vehículo detenido en zona prohibida',
+                  priority: 'HIGH',
+                  nowMs: t2,
+                });
+              }
+              if (autoEvidenceOn) {
+                globalEvidenceManager.captureAutomaticEvidence({
+                  videoElement,
+                  screenWidth: sw,
+                  screenHeight: sh,
+                  isFrontCamera: mirrorX,
+                  trackId,
+                  className: det.className,
+                  screenBox: det.screenBox,
+                  speedKmh: kinematics.speedKmh,
+                  speedLimitKmh: limitKmh,
+                  eventType: 'INVASION_ZONA_ROI',
+                  licensePlate,
+                  gpsCoordsText,
+                  nowMs: t2,
+                });
+              }
+            }
+
+            if (fallEval.isFallDetected) {
+              alertLabel = `CAIDA_DETECTADA_${fallEval.fallDurationSeconds}S`;
+              if (fallEval.justTriggeredFall) {
+                globalMobileAssistantSuite.speakAlert({
+                  enabled: Boolean(voiceOn),
+                  category: 'FALL_DETECTED',
+                  message: 'Alerta, posible caída detectada',
+                  priority: 'HIGH',
+                  nowMs: t2,
+                });
+              }
+              if (autoEvidenceOn) {
+                globalEvidenceManager.captureAutomaticEvidence({
+                  videoElement,
+                  screenWidth: sw,
+                  screenHeight: sh,
+                  isFrontCamera: mirrorX,
+                  trackId,
+                  className: det.className,
+                  screenBox: det.screenBox,
+                  speedKmh: kinematics.speedKmh,
+                  speedLimitKmh: limitKmh,
+                  eventType: 'CAIDA_DETECTADA',
+                  licensePlate: null,
+                  gpsCoordsText,
+                  nowMs: t2,
+                });
+              }
+            }
+
+            // Registrar en bitácora histórica CSV
+            if (kinematics.isVehicle || fallEval.isFallDetected) {
+              globalEvidenceManager.recordTelemetryLog({
+                nowMs: t2,
+                trackId,
+                className: det.className,
+                speedKmh: kinematics.speedKmh,
+                egoGpsSpeedKmh,
+                motionStatus: kinematics.status,
+                crossingDirection: crossing.direction,
+                insideRoi: roiEval.insideRoi,
+                licensePlate,
+                gpsCoordsText,
+                alertTriggered: alertLabel,
+                forceImmediate:
+                  isOverspeed || roiEval.justTriggeredViolation || fallEval.justTriggeredFall,
+              });
+            }
 
             updatedTracks.push({
               trackId,
@@ -1275,15 +1563,16 @@ export function useOnnxVisionEngine({
               isOverspeed,
               hasCrossedLine: crossing.hasCrossed,
               crossingDirection: crossing.direction,
+              insideRoi: roiEval.insideRoi,
+              roiDwellSeconds: roiEval.dwellSeconds,
+              isRoiViolation: roiEval.isViolation,
+              licensePlate,
+              isFallDetected: fallEval.isFallDetected,
+              fallDurationSeconds: fallEval.fallDurationSeconds,
+              hasProximityRisk: false,
               age,
               lostFrames: 0,
-              keypoints:
-                !vehiclesOnly &&
-                (det.keypoints ??
-                  (poseOn && det.classId === 0
-                    ? estimatePerson17KeypointsFromROI(det.screenBox, vx, nowSec, headBias)
-                    : [])) ||
-                [],
+              keypoints: personKeypoints,
               trail: nextTrail,
             });
           }
@@ -1304,6 +1593,55 @@ export function useOnnxVisionEngine({
           tracksRef.current = updatedTracks;
 
           const visibleDetections = updatedTracks.filter((tr) => tr.lostFrames <= 1);
+
+          // H) Evaluar Proximidad Crítica Peatón-Vehículo (Riesgo de Colisión) en Modo Universal
+          const proximityResult = !vehiclesOnly
+            ? globalHumanSafetyAnalytics.computePedestrianVehicleProximityLinks({
+                enabled: Boolean(humanSafetyOn),
+                persons: visibleDetections
+                  .filter((d) => d.classId === 0)
+                  .map((d) => ({
+                    trackId: d.trackId,
+                    centerX: d.centerX,
+                    centerY: d.centerY,
+                    width: d.screenBox.width,
+                    height: d.screenBox.height,
+                  })),
+                vehicles: visibleDetections
+                  .filter((d) => isCocoVehicleClass(d.classId, d.className))
+                  .map((d) => ({
+                    trackId: d.trackId,
+                    className: d.className,
+                    centerX: d.centerX,
+                    centerY: d.centerY,
+                    width: d.screenBox.width,
+                    height: d.screenBox.height,
+                    speedKmh: d.speedKmh,
+                    motionStatus: d.motionStatus,
+                  })),
+                screenWidth: sw,
+                screenHeight: sh,
+              })
+            : { links: [], riskTrackIds: new Set<number>(), newlyTriggeredLink: null };
+
+          if (proximityResult.riskTrackIds.size > 0) {
+            for (const det of visibleDetections) {
+              if (proximityResult.riskTrackIds.has(det.trackId)) {
+                det.hasProximityRisk = true;
+              }
+            }
+          }
+
+          if (proximityResult.newlyTriggeredLink) {
+            globalMobileAssistantSuite.speakAlert({
+              enabled: Boolean(voiceOn),
+              category: 'COLLISION_RISK',
+              message: 'Precaución, riesgo de colisión peatón vehículo',
+              priority: 'HIGH',
+              nowMs: t2,
+            });
+          }
+
           setDetections(visibleDetections);
           onNewFrame?.(visibleDetections);
 
@@ -1350,6 +1688,8 @@ export function useOnnxVisionEngine({
             let speedCount = 0;
             let maxSpeedKmh = 0;
             let activeOverspeedInView = 0;
+            let activeRoiViolationInView = false;
+            let activeFallInView = false;
 
             for (let i = 0; i < visibleDetections.length; i++) {
               const item = visibleDetections[i];
@@ -1358,6 +1698,10 @@ export function useOnnxVisionEngine({
               else if (cat === 'vehicle' || cat === 'bicycle') vehicles++;
               else if (cat === 'animal') animals++;
               else objects++;
+
+              if (item.isFallDetected) {
+                activeFallInView = true;
+              }
 
               if (isCocoVehicleClass(item.classId, item.className)) {
                 if (item.motionStatus === 'EN MOVIMIENTO') {
@@ -1372,6 +1716,9 @@ export function useOnnxVisionEngine({
                 }
                 if (item.isOverspeed) {
                   activeOverspeedInView++;
+                }
+                if (item.isRoiViolation) {
+                  activeRoiViolationInView = true;
                 }
               }
             }
@@ -1394,6 +1741,15 @@ export function useOnnxVisionEngine({
               activeOverspeedInView,
               activeBanner: globalSpeedAlertSystem.getActiveBanner(t3),
               countingStats: { ...globalVirtualCountingLine.getStats() },
+              roiViolationsCount: globalSpatialZonesROI.getTotalRoiViolations(),
+              activeRoiViolationInView,
+              fallAlertsCount: globalHumanSafetyAnalytics.getTotalFallAlerts(),
+              activeFallInView,
+              proximityAlertsCount: globalHumanSafetyAnalytics.getTotalProximityAlerts(),
+              proximityLinks: proximityResult.links,
+              egoGpsSpeedKmh,
+              gpsCoordsText,
+              evidencesCount: globalEvidenceManager.getEvidences().length,
             });
 
             setTimings(nextEma);

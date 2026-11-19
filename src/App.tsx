@@ -8,10 +8,14 @@ import {
   EyeOff,
   Flame,
   GitCommitHorizontal,
+  Hexagon,
+  Magnet,
+  Navigation,
   Radar,
   RefreshCw,
   RotateCcw,
   SlidersHorizontal,
+  Video,
   Volume2,
   VolumeX,
 } from 'lucide-react';
@@ -33,7 +37,7 @@ import {
   useOnnxVisionEngine,
 } from './hooks/useOnnxVisionEngine';
 import { useInertialARTracker } from './hooks/useInertialARTracker';
-import { DiagnosticsModal } from './components/DiagnosticsModal';
+import { DiagnosticsModal, DiagnosticsModalTab } from './components/DiagnosticsModal';
 import {
   AR_THEMES,
   AR_THEME_ORDER,
@@ -50,6 +54,15 @@ import {
 import { AdaptiveThermalController } from './utils/pipelineThermal';
 import { globalSpeedAlertSystem } from './utils/SpeedAlertSystem';
 import { globalVirtualCountingLine } from './utils/VirtualCountingLine';
+import {
+  globalSpatialZonesROI,
+  RoiPolygonPreset,
+  RoiSnapGuide,
+} from './modules/SpatialZonesROI';
+import {
+  ArRecorderState,
+  globalMobileAssistantSuite,
+} from './modules/MobileAssistantSuite';
 
 const INITIAL_SETTINGS: PipelineSettings = {
   confidenceThreshold: 0.40,
@@ -67,6 +80,15 @@ const INITIAL_SETTINGS: PipelineSettings = {
   enableSpeedSoundAlert: true,
   distanceCalibrationFactor: 1.0,
   showCountingLine: true,
+  enableAutoEvidence: true,
+  maxEvidenceRecords: 50,
+  enableRoiPolygon: false,
+  enableRoiSnapping: true,
+  roiDwellThresholdSeconds: 10,
+  enableAlpr: false,
+  enableHumanSafety: true,
+  enableVoiceAssistant: true,
+  enableDashcamGps: false,
 };
 
 function mapCocoNameToTargetClass(name: string): TargetClass {
@@ -100,6 +122,7 @@ export default function App() {
   const [facingMode, setFacingMode] = useState<WebCameraFacingMode>('environment');
   const [isSwitchingCamera, setIsSwitchingCamera] = useState(false);
   const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const [arOverlayCanvas, setArOverlayCanvas] = useState<HTMLCanvasElement | null>(null);
   const [cameraError, setCameraError] = useState<CameraErrorDetails | null>(null);
   const [permissionStatus, setPermissionStatus] = useState<PermissionStepStatus>({
     imu: 'idle',
@@ -113,6 +136,8 @@ export default function App() {
   }));
 
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnosticsInitialTab, setDiagnosticsInitialTab] =
+    useState<DiagnosticsModalTab>('telemetry');
   const [radarExpanded, setRadarExpanded] = useState(true);
   const [showFullHeatmapOverlay, setShowFullHeatmapOverlay] = useState(false);
   const [heatmapPoints, setHeatmapPoints] = useState<
@@ -140,24 +165,46 @@ export default function App() {
     lastResetAgoMs: 0,
   });
 
+  const [recorderStatus, setRecorderStatus] = useState<ArRecorderState>({
+    isRecording: false,
+    durationSec: 0,
+    mimeType: 'video/webm',
+  });
+
   const cameraRef = useRef<WebCameraStreamHandle | null>(null);
   const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const thermalControllerRef = useRef(new AdaptiveThermalController());
   const [lineEndpointsNorm, setLineEndpointsNorm] = useState(() =>
     globalVirtualCountingLine.getEndpointsNorm()
   );
+  const [roiVerticesNorm, setRoiVerticesNorm] = useState(() =>
+    globalSpatialZonesROI.getVerticesNorm()
+  );
+  const [roiSnapGuides, setRoiSnapGuides] = useState<RoiSnapGuide[]>([]);
   const [activeDragHandle, setActiveDragHandle] = useState<'a' | 'b' | null>(null);
+  const [activeRoiVertexIndex, setActiveRoiVertexIndex] = useState<0 | 1 | 2 | 3 | null>(
+    null
+  );
+
   const pointerDragRef = useRef<{
     active: boolean;
     draggingLineHandle: 'a' | 'b' | null;
+    draggingRoiVertex: 0 | 1 | 2 | 3 | null;
     lastX: number;
     lastY: number;
   }>({
     active: false,
     draggingLineHandle: null,
+    draggingRoiVertex: null,
     lastX: 0,
     lastY: 0,
   });
+
+  useEffect(() => {
+    return globalMobileAssistantSuite.subscribeRecorder((status) => {
+      setRecorderStatus(status);
+    });
+  }, []);
 
   // 1. Anclaje Espacial Inercial con Filtro de Kalman + LERP (useInertialARTracker.ts)
   const {
@@ -212,8 +259,17 @@ export default function App() {
   const speedSoundActive = settings.enableSpeedSoundAlert ?? true;
   const distCalibFactor = settings.distanceCalibrationFactor ?? 1.0;
   const showCountingLineActive = settings.showCountingLine ?? true;
+  const enableRoiPolygonActive = Boolean(settings.enableRoiPolygon);
+  const enableRoiSnappingActive = settings.enableRoiSnapping ?? true;
+  const roiDwellThresholdVal = settings.roiDwellThresholdSeconds ?? 10;
+  const enableAlprActive = Boolean(settings.enableAlpr);
+  const enableHumanSafetyActive = settings.enableHumanSafety ?? true;
+  const enableAutoEvidenceActive = settings.enableAutoEvidence ?? true;
+  const maxEvidenceRecordsVal = settings.maxEvidenceRecords ?? 50;
+  const enableVoiceAssistantActive = settings.enableVoiceAssistant ?? true;
+  const enableDashcamGpsActive = Boolean(settings.enableDashcamGps);
 
-  // 2. Motor de Inferencia ONNX Runtime Web + Modo Solo Vehículos + Velocímetro + Línea Virtual Aforo
+  // 2. Motor de Inferencia ONNX Runtime Web + Módulos Empresariales (Evidencia, ROI, ALPR, Seguridad, GPS y Voz)
   const {
     isEngineReady,
     engineStatusText,
@@ -240,6 +296,14 @@ export default function App() {
     enableSpeedSoundAlert: speedSoundActive,
     distanceCalibrationFactor: distCalibFactor,
     showCountingLine: showCountingLineActive,
+    enableAutoEvidence: enableAutoEvidenceActive,
+    maxEvidenceRecords: maxEvidenceRecordsVal,
+    enableRoiPolygon: enableRoiPolygonActive,
+    roiDwellThresholdSeconds: roiDwellThresholdVal,
+    enableAlpr: enableAlprActive,
+    enableHumanSafety: enableHumanSafetyActive,
+    enableVoiceAssistant: enableVoiceAssistantActive,
+    enableDashcamGps: enableDashcamGpsActive,
     inertialStateRef,
     isPaused: !settings.isRunning,
     onNewInferenceFrame: handleNewInferenceFrame,
@@ -337,14 +401,15 @@ export default function App() {
     }
 
     for (const det of detections) {
-      const col = det.isOverspeed
-        ? '#EF4444'
-        : activeTheme.categories[det.category]?.stroke ?? '#38BDF8';
+      const col =
+        det.isOverspeed || det.isRoiViolation || det.isFallDetected
+          ? '#EF4444'
+          : activeTheme.categories[det.category]?.stroke ?? '#38BDF8';
       const bx = Math.max(4, Math.min(w - 4, (det.centerX / Math.max(1, viewportSize.width)) * w));
       const by = Math.max(4, Math.min(h - 4, (det.centerY / Math.max(1, viewportSize.height)) * h));
       ctx.fillStyle = col;
       ctx.beginPath();
-      ctx.arc(bx, by, det.isOverspeed ? 4.2 : 3.2, 0, Math.PI * 2);
+      ctx.arc(bx, by, det.isOverspeed || det.isRoiViolation ? 4.2 : 3.2, 0, Math.PI * 2);
       ctx.fill();
     }
   }, [heatmapPoints, detections, radarExpanded, arStarted, settings.arTheme, viewportSize]);
@@ -353,11 +418,12 @@ export default function App() {
    * Secuencia obligatoria activada por el gesto onClick de "Iniciar Cámara AR":
    * (1) DeviceMotionEvent.requestPermission() en iOS 13+ Safari
    * (2) navigator.mediaDevices.getUserMedia + await videoElement.play()
-   * (3) Desbloqueo de Web Audio API (SpeedAlertSystem) y transición al HUD AR en vivo
+   * (3) Desbloqueo de Web Audio API (SpeedAlertSystem) + Web Speech API (MobileAssistantSuite)
    */
   const handleStartARCamera = useCallback(async () => {
     setCameraError(null);
     globalSpeedAlertSystem.unlockAudioContext();
+    globalMobileAssistantSuite.unlockVoiceSynthesis();
 
     setPermissionStatus((prev) => ({ ...prev, imu: 'requesting' }));
     const imuResult = await requestMobileInertialSensorsPermission();
@@ -373,6 +439,7 @@ export default function App() {
 
     unlockAudioAndHapticsOnGesture();
     globalSpeedAlertSystem.unlockAudioContext();
+    globalMobileAssistantSuite.unlockVoiceSynthesis();
     setPermissionStatus((prev) => ({ ...prev, camera: 'granted' }));
     setVideoElement(videoEl);
     setArStarted(true);
@@ -432,28 +499,78 @@ export default function App() {
     setHeatmapPoints([]);
   }, []);
 
-  // Soporte táctil/arrastre para mover los nodos A y B de la Línea Virtual de Aforo o probar el Filtro de Kalman
+  const handleResetRoiPolygon = useCallback(() => {
+    const resetVerts = globalSpatialZonesROI.resetDefaultPolygon();
+    setRoiVerticesNorm([...resetVerts] as typeof roiVerticesNorm);
+    setRoiSnapGuides([]);
+  }, []);
+
+  const handleApplyRoiPreset = useCallback((preset: RoiPolygonPreset) => {
+    const presetVerts = globalSpatialZonesROI.applyPolygonPreset(preset);
+    setRoiVerticesNorm([...presetVerts] as typeof roiVerticesNorm);
+    setRoiSnapGuides([]);
+  }, []);
+
+  const handleToggleArRecording = useCallback(() => {
+    if (!videoElement || !arOverlayCanvas) return;
+    globalMobileAssistantSuite.toggleArVideoRecording({
+      videoElement,
+      arOverlayCanvas,
+      isFrontCamera: facingMode === 'user',
+    });
+  }, [videoElement, arOverlayCanvas, facingMode]);
+
+  const openModalTab = useCallback((tab: DiagnosticsModalTab) => {
+    setDiagnosticsInitialTab(tab);
+    setDiagnosticsOpen(true);
+  }, []);
+
+  // Soporte táctil/arrastre para mover los 4 vértices del Polígono ROI (V1..V4), los nodos A/B de la Línea de Aforo o el Giroscopio
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest('button')) return;
 
+    const hitRadius = 32;
+    let draggingRoiIdx: 0 | 1 | 2 | 3 | null = null;
     let draggingHandle: 'a' | 'b' | null = null;
-    if (showCountingLineActive && viewportSize.width > 0 && viewportSize.height > 0) {
+
+    if (enableRoiPolygonActive && viewportSize.width > 0 && viewportSize.height > 0) {
+      const roiPts = globalSpatialZonesROI.getVerticesPixels(
+        viewportSize.width,
+        viewportSize.height
+      );
+      let minDist = hitRadius;
+      for (let i = 0; i < 4; i++) {
+        const d = Math.hypot(e.clientX - roiPts[i].x, e.clientY - roiPts[i].y);
+        if (d <= minDist) {
+          minDist = d;
+          draggingRoiIdx = i as 0 | 1 | 2 | 3;
+        }
+      }
+    }
+
+    if (
+      draggingRoiIdx === null &&
+      showCountingLineActive &&
+      viewportSize.width > 0 &&
+      viewportSize.height > 0
+    ) {
       const { a, b } = globalVirtualCountingLine.getEndpointsPixels(
         viewportSize.width,
         viewportSize.height
       );
       const distA = Math.hypot(e.clientX - a.x, e.clientY - a.y);
       const distB = Math.hypot(e.clientX - b.x, e.clientY - b.y);
-      const hitRadius = 32;
       if (distA <= hitRadius || distB <= hitRadius) {
         draggingHandle = distA <= distB ? 'a' : 'b';
       }
     }
 
+    setActiveRoiVertexIndex(draggingRoiIdx);
     setActiveDragHandle(draggingHandle);
     pointerDragRef.current = {
       active: true,
       draggingLineHandle: draggingHandle,
+      draggingRoiVertex: draggingRoiIdx,
       lastX: e.clientX,
       lastY: e.clientY,
     };
@@ -461,6 +578,28 @@ export default function App() {
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!pointerDragRef.current.active) return;
+
+    if (
+      pointerDragRef.current.draggingRoiVertex !== null &&
+      viewportSize.width > 0 &&
+      viewportSize.height > 0
+    ) {
+      const { verticesNorm: snappedVertices, snapGuides } =
+        globalSpatialZonesROI.setVertexNormWithSnapping({
+          index: pointerDragRef.current.draggingRoiVertex,
+          rawXNorm: e.clientX / viewportSize.width,
+          rawYNorm: e.clientY / viewportSize.height,
+          screenWidth: viewportSize.width,
+          screenHeight: viewportSize.height,
+          enableSnapping: enableRoiSnappingActive,
+          countingLineNorm: showCountingLineActive ? lineEndpointsNorm : undefined,
+        });
+      setRoiVerticesNorm([...snappedVertices]);
+      setRoiSnapGuides(snapGuides);
+      pointerDragRef.current.lastX = e.clientX;
+      pointerDragRef.current.lastY = e.clientY;
+      return;
+    }
 
     if (
       pointerDragRef.current.draggingLineHandle &&
@@ -489,7 +628,11 @@ export default function App() {
   const handlePointerUp = () => {
     pointerDragRef.current.active = false;
     pointerDragRef.current.draggingLineHandle = null;
+    pointerDragRef.current.draggingRoiVertex = null;
     setActiveDragHandle(null);
+    setActiveRoiVertexIndex(null);
+    globalSpatialZonesROI.clearActiveSnapGuides();
+    setRoiSnapGuides([]);
   };
 
   const autoThermal = thermalControllerRef.current.evaluate(timings.totalMs);
@@ -552,6 +695,13 @@ export default function App() {
     isOverspeed: d.isOverspeed,
     hasCrossedLine: d.hasCrossedLine,
     crossingDirection: d.crossingDirection,
+    insideRoi: d.insideRoi,
+    roiDwellSeconds: d.roiDwellSeconds,
+    isRoiViolation: d.isRoiViolation,
+    licensePlate: d.licensePlate ?? undefined,
+    isFallDetected: d.isFallDetected,
+    fallDurationSeconds: d.fallDurationSeconds,
+    hasProximityRisk: d.hasProximityRisk,
   }));
 
   const activeThemeSpec = AR_THEMES[settings.arTheme] ?? AR_THEMES.tactical;
@@ -579,7 +729,7 @@ export default function App() {
         onStreamError={handleStreamError}
       />
 
-      {/* 2. HUD AR Avanzado en Canvas HiDPI (Retículas + Velocímetro km/h + Alerta Roja + Línea Virtual Aforo) */}
+      {/* 2. HUD AR Avanzado en Canvas HiDPI (Retículas + Velocímetro + Polígono ROI + Colisión Peatón + Caídas + Aforo) */}
       <ARWebCanvasOverlay
         detections={detections}
         arTheme={settings.arTheme}
@@ -589,6 +739,12 @@ export default function App() {
         onlyVehiclesMode={onlyVehiclesActive}
         lineEndpointsNorm={lineEndpointsNorm}
         activeDragHandle={activeDragHandle}
+        enableRoiPolygon={enableRoiPolygonActive}
+        roiVerticesNorm={roiVerticesNorm}
+        activeRoiVertexIndex={activeRoiVertexIndex}
+        activeRoiViolationInView={trafficTelemetry.activeRoiViolationInView}
+        roiSnapGuides={roiSnapGuides}
+        proximityLinks={trafficTelemetry.proximityLinks}
         showHeatmapOverlay={showFullHeatmapOverlay}
         heatmapPoints={heatmapPoints}
         screenWidth={viewportSize.width}
@@ -596,6 +752,7 @@ export default function App() {
         inertialStateRef={inertialStateRef}
         computeAnchoredDetectionState={computeAnchoredDetectionState}
         decayInertialOffsetOnRenderFrame={decayInertialOffsetOnRenderFrame}
+        onCanvasReady={setArOverlayCanvas}
       />
 
       {/* 3. Pantalla Inicial Inmersiva con Botón Flotante "Iniciar Cámara AR" */}
@@ -642,6 +799,29 @@ export default function App() {
             </div>
 
             <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap">
+              {/* Botón de Grabación de Video AR (MediaRecorder Composite 30 FPS) */}
+              <button
+                type="button"
+                onClick={handleToggleArRecording}
+                title="Grabar Clip de Video AR (Video Cámara + Gráficos AR Superpuestos a 30 FPS)"
+                className={`min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg whitespace-nowrap ${
+                  recorderStatus.isRecording
+                    ? 'bg-red-600/90 border-red-300 text-white animate-pulse'
+                    : 'bg-[#0B0F17]/65 border-slate-700/80 text-slate-100 hover:bg-slate-900/80'
+                }`}
+              >
+                <Video
+                  className={`w-3.5 h-3.5 ${
+                    recorderStatus.isRecording ? 'text-white' : 'text-rose-400'
+                  }`}
+                />
+                <span className="font-mono">
+                  {recorderStatus.isRecording
+                    ? `REC ${recorderStatus.durationSec}s`
+                    : 'REC'}
+                </span>
+              </button>
+
               {/* Botón de Modo Exclusivo de Vehículos (VehicleModeToggle) */}
               <button
                 type="button"
@@ -662,6 +842,41 @@ export default function App() {
                   {onlyVehiclesActive ? 'Modo: Solo Vehículos' : 'Modo: Todos (80 COCO)'}
                 </span>
               </button>
+
+              {/* Botón Rápido de Zona Poligonal ROI (V1..V4) */}
+              <button
+                type="button"
+                onClick={() =>
+                  handleUpdateSettings({ enableRoiPolygon: !enableRoiPolygonActive })
+                }
+                style={glassStyle}
+                title="Activar/Desactivar Polígono ROI de Zona Prohibida (Arrastra los 4 vértices V1..V4)"
+                className={`min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                  enableRoiPolygonActive ? 'text-amber-300 border-amber-400/60' : 'text-slate-400'
+                }`}
+              >
+                <Hexagon className="w-3.5 h-3.5 text-amber-400" />
+                <span>ROI {enableRoiPolygonActive ? 'ON' : 'OFF'}</span>
+              </button>
+
+              {enableRoiPolygonActive && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleUpdateSettings({ enableRoiSnapping: !enableRoiSnappingActive })
+                  }
+                  style={glassStyle}
+                  title="Activar/Desactivar Ajuste Magnético (Snapping) de Vértices ROI a Carriles en Perspectiva y Bordes Ortogonales"
+                  className={`min-h-[42px] px-2.5 rounded-2xl backdrop-blur-md border text-[11px] font-semibold flex items-center gap-1 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                    enableRoiSnappingActive
+                      ? 'text-cyan-300 border-cyan-400/60'
+                      : 'text-slate-400'
+                  }`}
+                >
+                  <Magnet className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Snap {enableRoiSnappingActive ? 'ON' : 'OFF'}</span>
+                </button>
+              )}
 
               {/* Controles rápidos de Línea Virtual de Aforo */}
               <button
@@ -692,6 +907,31 @@ export default function App() {
                   H/V
                 </button>
               )}
+
+              {/* Botón Rápido de Asistente de Voz Sintetizada */}
+              <button
+                type="button"
+                onClick={() => {
+                  globalMobileAssistantSuite.unlockVoiceSynthesis();
+                  handleUpdateSettings({
+                    enableVoiceAssistant: !enableVoiceAssistantActive,
+                  });
+                }}
+                style={glassStyle}
+                title="Activar/Silenciar Asistente de Voz en Tiempo Real (Web Speech API es-ES)"
+                className={`min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                  enableVoiceAssistantActive ? 'text-sky-300' : 'text-slate-400'
+                }`}
+              >
+                {enableVoiceAssistantActive ? (
+                  <Volume2 className="w-3.5 h-3.5 text-sky-400" />
+                ) : (
+                  <VolumeX className="w-3.5 h-3.5 text-slate-400" />
+                )}
+                <span className="hidden sm:inline">
+                  Voz {enableVoiceAssistantActive ? 'ON' : 'OFF'}
+                </span>
+              </button>
 
               <button
                 type="button"
@@ -738,15 +978,23 @@ export default function App() {
             </div>
           </div>
 
-          {/* Banner Superior de Alerta de Exceso de Velocidad (#EF4444 Pulsante) */}
-          {activeOverspeedBanner && (
+          {/* Banner Superior de Alerta de Exceso de Velocidad / Invasión ROI / Caída (#EF4444 Pulsante) */}
+          {(activeOverspeedBanner ||
+            trafficTelemetry.activeRoiViolationInView ||
+            trafficTelemetry.activeFallInView) && (
             <div className="fixed top-16 left-1/2 -translate-x-1/2 z-30 pointer-events-auto">
               <div className="px-4 py-2 rounded-2xl bg-red-600/90 border-2 border-red-300 text-white shadow-2xl shadow-red-600/40 flex items-center gap-2.5 animate-pulse">
                 <AlertTriangle className="w-4 h-4 text-yellow-200 shrink-0" />
                 <span className="font-mono text-xs sm:text-sm font-extrabold tracking-wide whitespace-nowrap">
-                  ⚠️ EXCESO DETECTADO: {activeOverspeedBanner.className.toUpperCase()} #
-                  {activeOverspeedBanner.trackId} • {activeOverspeedBanner.speedKmh} km/h (Límite{' '}
-                  {activeOverspeedBanner.limitKmh})
+                  {activeOverspeedBanner
+                    ? `⚠️ EXCESO DETECTADO: ${activeOverspeedBanner.className.toUpperCase()} #${
+                        activeOverspeedBanner.trackId
+                      } • ${activeOverspeedBanner.speedKmh} km/h (Límite ${
+                        activeOverspeedBanner.limitKmh
+                      })`
+                    : trafficTelemetry.activeRoiViolationInView
+                    ? '⚠️ INVASIÓN / DETENCIÓN PROHIBIDA EN ZONA ROI'
+                    : '⚠️ ALERTA DE SEGURIDAD: POSIBLE CAÍDA HUMANA DETECTADA'}
                 </span>
               </div>
             </div>
@@ -808,7 +1056,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Píldora 3: Velocidad Promedio (Avg: XX km/h) y Contador de Excesos en Rojo */}
+              {/* Píldora 3: Velocidad Promedio (Avg: XX km/h), Contador de Excesos y Galería de Evidencias */}
               <div
                 style={glassStyle}
                 className="pointer-events-auto px-3.5 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-lg"
@@ -830,26 +1078,14 @@ export default function App() {
                 >
                   Excesos: {trafficTelemetry.overspeedTotalCount}
                 </span>
+
                 <button
                   type="button"
-                  onClick={() => {
-                    globalSpeedAlertSystem.unlockAudioContext();
-                    handleUpdateSettings({
-                      enableSpeedSoundAlert: !speedSoundActive,
-                    });
-                  }}
-                  title="Activar/Silenciar Alerta Sonora Web Audio API"
-                  className={`p-1 rounded-lg border transition-colors cursor-pointer ${
-                    speedSoundActive
-                      ? 'bg-red-500/20 border-red-500/40 text-red-300'
-                      : 'bg-slate-800/70 border-slate-700 text-slate-400'
-                  }`}
+                  onClick={() => openModalTab('evidences')}
+                  title="Abrir Galería de Foto-Multas AR y Exportar CSV"
+                  className="px-2 py-0.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/50 text-rose-200 font-mono text-[11px] font-bold cursor-pointer"
                 >
-                  {speedSoundActive ? (
-                    <Volume2 className="w-3.5 h-3.5" />
-                  ) : (
-                    <VolumeX className="w-3.5 h-3.5" />
-                  )}
+                  Evidencias: {trafficTelemetry.evidencesCount}
                 </button>
               </div>
             </div>
@@ -894,37 +1130,35 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Resumen compacto de Aforo y Velocidad si hay vehículos o línea activa */}
-              {(showCountingLineActive || counts.vehicles > 0) && (
-                <div
-                  style={glassStyle}
-                  className="pointer-events-auto px-3 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-md"
+              {/* Resumen compacto de Aforo, Velocidad, Evidencias y GPS Dashcam */}
+              <div
+                style={glassStyle}
+                className="pointer-events-auto px-3 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-md"
+              >
+                <span className="font-mono text-sky-300 font-semibold">
+                  Aforo: {cStats.total} (↑{cStats.inbound} ↓{cStats.outbound})
+                </span>
+                <span className="text-slate-600">·</span>
+                <span className="font-mono text-orange-300 font-semibold">
+                  Avg: {trafficTelemetry.averageSpeedKmh} km/h
+                </span>
+                {enableDashcamGpsActive && (
+                  <>
+                    <span className="text-slate-600">·</span>
+                    <span className="font-mono text-emerald-300 font-semibold flex items-center gap-1">
+                      <Navigation className="w-3 h-3" />
+                      GPS: {trafficTelemetry.egoGpsSpeedKmh} km/h
+                    </span>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => openModalTab('evidences')}
+                  className="px-2 py-0.5 rounded-md bg-rose-500/20 border border-rose-400/50 text-rose-200 font-mono text-[10.5px] font-bold cursor-pointer"
                 >
-                  <span className="font-mono text-sky-300 font-semibold">
-                    Aforo: {cStats.total} (↑{cStats.inbound} ↓{cStats.outbound})
-                  </span>
-                  <span className="text-slate-600">·</span>
-                  <span className="font-mono text-orange-300 font-semibold">
-                    Avg: {trafficTelemetry.averageSpeedKmh} km/h
-                  </span>
-                  {trafficTelemetry.overspeedTotalCount > 0 && (
-                    <>
-                      <span className="text-slate-600">·</span>
-                      <span className="font-mono font-bold text-red-400">
-                        ⚠️ {trafficTelemetry.overspeedTotalCount} Exceso
-                      </span>
-                    </>
-                  )}
-                  <button
-                    type="button"
-                    onClick={resetTrafficCounts}
-                    title="Reiniciar Aforo"
-                    className="text-[10.5px] font-mono text-sky-400 hover:underline cursor-pointer"
-                  >
-                    Reset
-                  </button>
-                </div>
-              )}
+                  Foto-Multas ({trafficTelemetry.evidencesCount})
+                </button>
+              </div>
             </div>
           )}
 
@@ -1024,22 +1258,35 @@ export default function App() {
               </div>
             </button>
 
-            <button
-              type="button"
-              onClick={() => setDiagnosticsOpen(true)}
-              style={glassStyle}
-              className="pointer-events-auto min-h-[44px] px-4 rounded-2xl backdrop-blur-md border hover:bg-slate-900/80 text-slate-100 text-xs font-semibold flex items-center gap-2 shadow-xl transition-colors cursor-pointer whitespace-nowrap"
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
-              <span>Ajustes y Telemetría</span>
-            </button>
+            <div className="pointer-events-auto flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => openModalTab('evidences')}
+                style={glassStyle}
+                className="min-h-[44px] px-3.5 rounded-2xl backdrop-blur-md border hover:bg-slate-900/80 text-rose-300 text-xs font-semibold flex items-center gap-1.5 shadow-xl transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <Camera className="w-3.5 h-3.5 text-rose-400" />
+                <span>Evidencias ({trafficTelemetry.evidencesCount})</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openModalTab('telemetry')}
+                style={glassStyle}
+                className="min-h-[44px] px-4 rounded-2xl backdrop-blur-md border hover:bg-slate-900/80 text-slate-100 text-xs font-semibold flex items-center gap-2 shadow-xl transition-colors cursor-pointer whitespace-nowrap"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                <span>Ajustes y Telemetría</span>
+              </button>
+            </div>
           </div>
         </>
       )}
 
-      {/* 5. Bottom Sheet de Ajustes, Radar de Tráfico, Telemetría y Explorador de Código ONNX Web / RN */}
+      {/* 5. Bottom Sheet de Ajustes, Galería de Evidencias + CSV, Zonas ROI, ALPR, Seguridad, GPS y Voz */}
       <DiagnosticsModal
         visible={diagnosticsOpen}
+        initialTab={diagnosticsInitialTab}
         settings={settings}
         metrics={modalMetrics}
         tracks={modalTracks}
@@ -1050,6 +1297,11 @@ export default function App() {
         onUpdate={handleUpdateSettings}
         onResetHeatmap={handleResetHeatmap}
         onResetTrafficCounts={resetTrafficCounts}
+        onToggleLineOrientation={() =>
+          setLineEndpointsNorm({ ...globalVirtualCountingLine.toggleOrientation() })
+        }
+        onResetRoiPolygon={handleResetRoiPolygon}
+        onApplyRoiPreset={handleApplyRoiPreset}
         onClose={() => setDiagnosticsOpen(false)}
       />
     </div>

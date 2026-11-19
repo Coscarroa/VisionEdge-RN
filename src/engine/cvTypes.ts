@@ -83,6 +83,20 @@ export interface TrackedObject extends DetectionResult {
   isOverspeed?: boolean;
   hasCrossedLine?: boolean;
   crossingDirection?: 'ENTRADA' | 'SALIDA' | null;
+  /** Indica si el centroide del vehículo se encuentra dentro del Polígono ROI */
+  insideRoi?: boolean;
+  /** Segundos acumulados detenido dentro del Polígono ROI */
+  roiDwellSeconds?: number;
+  /** Alerta activa de invasión / detención prohibida en Polígono ROI */
+  isRoiViolation?: boolean;
+  /** Matrícula leída por ALPR (tesseract.js Web Worker) */
+  licensePlate?: string;
+  /** Indica si se detectó posible caída humana por análisis biomecánico de 17 keypoints */
+  isFallDetected?: boolean;
+  /** Segundos en postura horizontal inmóvil */
+  fallDurationSeconds?: number;
+  /** Indica si el peatón o vehículo está en riesgo crítico de colisión por proximidad */
+  hasProximityRisk?: boolean;
 }
 
 export interface CategoryStats {
@@ -156,6 +170,24 @@ export interface PipelineSettings {
   distanceCalibrationFactor?: number;
   /** Muestra u oculta la Línea Virtual de Conteo y Aforo (Tripwire AR) */
   showCountingLine?: boolean;
+  /** Captura automática de foto-multa AR en memoria + IndexedDB al detectar infracción */
+  enableAutoEvidence?: boolean;
+  /** Límite circular de capturas almacenadas en IndexedDB (10..100, por defecto 50) */
+  maxEvidenceRecords?: number;
+  /** Muestra y activa el Polígono ROI de 4 vértices (Zona de Exclusión / Estacionamiento Prohibido) */
+  enableRoiPolygon?: boolean;
+  /** Activa el ajuste magnético (Snapping) de los vértices ROI a carriles en perspectiva, ejes ortogonales y línea de aforo */
+  enableRoiSnapping?: boolean;
+  /** Segundos detenido dentro del Polígono ROI para disparar alerta de invasión (3..30s, por defecto 10s) */
+  roiDwellThresholdSeconds?: number;
+  /** Lectura opcional de matrículas ALPR con tesseract.js en Web Worker (apagado por defecto) */
+  enableAlpr?: boolean;
+  /** Análisis biomecánico de caídas por keypoints y riesgo de colisión peatón-vehículo */
+  enableHumanSafety?: boolean;
+  /** Asistente de voz sintetizada en tiempo real (Web Speech API es-ES / es-MX) */
+  enableVoiceAssistant?: boolean;
+  /** Modo Dashcam con compensación de velocidad propia por GPS (navigator.geolocation.watchPosition) */
+  enableDashcamGps?: boolean;
 }
 
 export const COCO_KEYPOINT_NAMES = [

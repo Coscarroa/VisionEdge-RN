@@ -10,6 +10,12 @@ import arWebCanvasOverlayRaw from '../components/ARWebCanvasOverlay.tsx?raw';
 import vehicleSpeedEstimatorRaw from '../utils/VehicleSpeedEstimator.ts?raw';
 import speedAlertSystemRaw from '../utils/SpeedAlertSystem.ts?raw';
 import virtualCountingLineRaw from '../utils/VirtualCountingLine.ts?raw';
+import evidenceAndReportsModuleRaw from '../modules/EvidenceAndReportsModule.ts?raw';
+import spatialZonesRoiRaw from '../modules/SpatialZonesROI.ts?raw';
+import humanSafetyAnalyticsRaw from '../modules/HumanSafetyAnalytics.ts?raw';
+import mobileAssistantSuiteRaw from '../modules/MobileAssistantSuite.ts?raw';
+import arCanvasRenderWorkerRaw from '../workers/arCanvasRenderWorker.ts?raw';
+import arOverlayRendererCoreRaw from '../workers/arOverlayRendererCore.ts?raw';
 import exportOnnxWebColabRaw from '../../scripts/export_onnx_web_colab.py?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
@@ -27,16 +33,24 @@ export interface CodeFileNode {
 
 export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 ├── src/
-│   ├── App.tsx                              # Visor AR ONNX + VehicleModeToggle + Radar de Tráfico y Aforo AR
+│   ├── App.tsx                              # Visor AR ONNX + Radar Vehicular + ROI + REC Video + Voz + GPS
+│   ├── workers/
+│   │   ├── arCanvasRenderWorker.ts          # Dedicated Web Worker con OffscreenCanvas (60/120 FPS fuera del Main Thread)
+│   │   └── arOverlayRendererCore.ts         # Motor Puro 2D AR + Kalman 1D + LERP + Caché LRU de measureText()
+│   ├── modules/
+│   │   ├── EvidenceAndReportsModule.ts      # Photo-Multa AR (Canvas Crop + Cintillo) + IndexedDB Circular + CSV
+│   │   ├── SpatialZonesROI.ts               # Polígono ROI 4 Vértices (Ray-Casting) + ALPR Tesseract.js Web Worker
+│   │   ├── HumanSafetyAnalytics.ts          # Detección de Caídas 17kp (>2.5s) + Riesgo Colisión Peatón-Vehículo
+│   │   └── MobileAssistantSuite.ts          # Asistente Voz (Web Speech ES) + GPS Dashcam + Grabador Video AR 30FPS
 │   ├── components/
 │   │   ├── ARStartOverlay.tsx               # Botón flotante "Iniciar Cámara AR" + Permisos iOS 13+ IMU/WebRTC
 │   │   ├── WebCameraStream.tsx              # getUserMedia progresivo + playsInline Safari/Samsung + Switch Cam
-│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HiDPI + Retículas Neón + Línea Virtual Aforo + Alerta Exceso
+│   │   ├── ARWebCanvasOverlay.tsx           # Puente OffscreenCanvas + WeakMap StrictMode + Sync Inercial Kalman
 │   │   ├── AROverlayCanvas.tsx              # Skia AR Full-Screen (React Native) + LERP + 60Hz Gyro Offset
 │   │   ├── DetectionOverlayCanvas.tsx       # Skia PictureRecorder 60 FPS (cero re-renders)
-│   │   └── DiagnosticsModal.tsx             # Bottom Sheet (Radar Vehicular, Aforo, Telemetría y Explorador Código)
+│   │   └── DiagnosticsModal.tsx             # Centro de Comando: Telemetría, Galería Evidencias/CSV, ROI/ALPR/GPS/Voz
 │   ├── hooks/
-│   │   ├── useOnnxVisionEngine.ts           # ONNX Runtime Web + Modo Solo Vehículos (Clases 1-8) + Pausa Pose
+│   │   ├── useOnnxVisionEngine.ts           # ONNX Runtime Web + Modo Vehículos + ROI + ALPR + Seguridad + Evidencias
 │   │   ├── useInertialARTracker.ts          # Filtro de Kalman 1D + LERP + devicemotion/deviceorientation 60/120Hz
 │   │   ├── useWebVisionEngine.ts            # Motor WebGPU -> WebGL -> WASM + 80 Clases COCO + 17kp Pose
 │   │   ├── useGyroARStabilization.ts        # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
@@ -44,7 +58,7 @@ export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 │   ├── config/
 │   │   └── ARThemeConfig.ts                 # 3 estilos visuales AR (Táctico Cian, Nativo Frosted, Industrial)
 │   ├── utils/
-│   │   ├── VehicleSpeedEstimator.ts         # Motor Cinemático Monocular (km/h) + Compensación IMU + Histéresis
+│   │   ├── VehicleSpeedEstimator.ts         # Motor Cinemático Monocular (km/h) + Compensación IMU & GPS Dashcam
 │   │   ├── SpeedAlertSystem.ts              # Alerta Visual Roja Pulsante + Web Audio API OscillatorNode (3s Cooldown)
 │   │   ├── VirtualCountingLine.ts           # Línea Virtual de Aforo AR + Intersección Vectorial 2D + Set<trackId>
 │   │   ├── visionPostProcessor.ts           # Zero-alloc YOLO decode (80 COCO) + Class-NMS + ByteTrack
@@ -62,6 +76,90 @@ export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 └── vite.config.ts                           # Configuración MIME/CORS para servir .onnx y .wasm sin errores`;
 
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
+  {
+    id: 'ar-canvas-render-worker',
+    path: 'src/workers/arCanvasRenderWorker.ts',
+    name: 'arCanvasRenderWorker.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Web Worker dedicado de renderizado AR con OffscreenCanvas: recibe el control transferido del <canvas> (transferControlToOffscreen), inicializa el contexto 2D con desynchronized: true y ejecuta un bucle de animación autónomo a 60/120 FPS fuera del hilo principal.',
+    highlights: [
+      'Transferencia zero-copy del lienzo mediante INIT_CANVAS con lista de transferencia [offscreen]',
+      'Contexto 2D configurado con { alpha: true, desynchronized: true } para mínima latencia de composición GPU',
+      'Mensajes desacoplados UPDATE_SCENE, UPDATE_GYRO y RESIZE para mantener el hilo principal libre durante inferencia ONNX',
+    ],
+    content: arCanvasRenderWorkerRaw,
+  },
+  {
+    id: 'ar-overlay-renderer-core',
+    path: 'src/workers/arOverlayRendererCore.ts',
+    name: 'arOverlayRendererCore.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Motor puro de renderizado 2D AR ejecutado dentro del Worker de OffscreenCanvas: procesa interpolación espacial Kalman 1D + LERP por trackId, caché LRU de measureText() para alta densidad de etiquetas, malla táctica de polígonos ROI complejos, estelas degradadas y esqueletos de 17 puntos.',
+    highlights: [
+      'Filtros de Kalman 1D + LERP por trackId ejecutados directamente en el Worker a 60/120 FPS sin bloquear React',
+      'Caché LRU de métricas tipográficas (measureCachedTextWidth) que elimina cuellos de botella de measureText() en escenas densas',
+      'Compatible tanto con OffscreenCanvasRenderingContext2D en el Worker como con CanvasRenderingContext2D de respaldo',
+    ],
+    content: arOverlayRendererCoreRaw,
+  },
+  {
+    id: 'evidence-and-reports-module',
+    path: 'src/modules/EvidenceAndReportsModule.ts',
+    name: 'EvidenceAndReportsModule.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Módulo de Evidencia Automática (Photo-Multa AR), Almacenamiento Circular en IndexedDB y Exportación CSV: captura recortes de alta resolución del <video> con retícula y cintillo telemétrico estampado (Fecha ISO, Clase + Track ID, km/h, Placa ALPR, GPS) con cooldown de 5s por trackId, persiste hasta N registros en IndexedDB y exporta reportes .csv mediante Blob.',
+    highlights: [
+      'Recorte automático en <canvas> temporal con corrección object-fit: cover y cintillo telemétrico estampado en JPEG',
+      'Persistencia circular en IndexedDB (VisionEdgeEvidenceDB) configurable (10..100 capturas) con descarga individual .jpg',
+      'Exportador CSV (exportTelemetryCSV) con historial completo: timestamp_iso, track_id, clase, velocidad_kmh, placa_alpr, gps y alertas',
+    ],
+    content: evidenceAndReportsModuleRaw,
+  },
+  {
+    id: 'spatial-zones-roi',
+    path: 'src/modules/SpatialZonesROI.ts',
+    name: 'SpatialZonesROI.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Módulo de Inteligencia Espacial (Polígono ROI de 4 vértices arrastrables V1..V4) y Reconocimiento Óptico de Matrículas (ALPR con tesseract.js en Web Worker): evalúa permanencia de vehículos detenidos con algoritmo Ray-Casting (isPointInPolygon) y ejecuta OCR alfanumérico sobre el tercio inferior del vehículo sin degradar los FPS de ONNX.',
+    highlights: [
+      'Algoritmo geométrico Ray-Casting (isPointInPolygon) sobre 4 vértices normalizados arrastrables en el visor AR',
+      'Temporizador de permanencia por trackId: dispara alerta roja de INVASIÓN / DETENCIÓN PROHIBIDA al superar el umbral (ej. 10s)',
+      'ALPR asíncrono con tesseract.js en Web Worker + preprocesamiento en escala de grises de alto contraste sobre el tercio inferior',
+    ],
+    content: spatialZonesRoiRaw,
+  },
+  {
+    id: 'human-safety-analytics',
+    path: 'src/modules/HumanSafetyAnalytics.ts',
+    name: 'HumanSafetyAnalytics.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Módulo de Seguridad Laboral y Ergonomía por Pose Estimation (17 Keypoints): detecta caídas humanas evaluando la relación de aspecto (width/height > 1.25), colapso vertical hombros-caderas-tobillos e inmovilidad > 2.5 segundos, y calcula enlaces de riesgo de colisión peatón-vehículo por distancia euclidiana con compensación de perspectiva.',
+    highlights: [
+      'Detección biomecánica de caídas con los 17 keypoints (hombros 5-6, caderas 11-12, tobillos 15-16) + temporizador > 2.5s',
+      'Cálculo de proximidad crítica peatón-vehículo en movimiento con línea de advertencia ámbar/carmesí (⚠️ RIESGO DE COLISIÓN)',
+      'Integrado con captura automática de evidencia (Photo-Multa AR) y alerta de voz sintetizada en español',
+    ],
+    content: humanSafetyAnalyticsRaw,
+  },
+  {
+    id: 'mobile-assistant-suite',
+    path: 'src/modules/MobileAssistantSuite.ts',
+    name: 'MobileAssistantSuite.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Suite de Asistente Móvil: sintetizador de voz en tiempo real en español (Web Speech API window.speechSynthesis) con cola de prioridad y cooldown, Modo Dashcam con compensación de velocidad propia GPS (navigator.geolocation.watchPosition) y grabador de video AR (MediaRecorder a 30 FPS combinando <video> + <canvas> AR).',
+    highlights: [
+      'Web Speech API (es-ES / es-MX) desbloqueada en el gesto "Iniciar Cámara AR" con anuncios manos libres de velocidad, ROI y caídas',
+      'Modo Dashcam GPS (navigator.geolocation.watchPosition) que resta la velocidad propia del teléfono en VehicleSpeedEstimator.ts',
+      'Grabador de Video AR (MediaRecorder + compositorCanvas.captureStream(30)) que descarga clips .mp4/.webm con todo el HUD AR incrustado',
+    ],
+    content: mobileAssistantSuiteRaw,
+  },
   {
     id: 'vehicle-speed-estimator',
     path: 'src/utils/VehicleSpeedEstimator.ts',
