@@ -1,33 +1,54 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  ARVisualTheme,
-  CategoryStats,
+  Camera,
+  Compass,
+  Eye,
+  EyeOff,
+  Flame,
+  Radar,
+  RefreshCw,
+  SlidersHorizontal,
+} from 'lucide-react';
+import {
+  ARStartOverlay,
+  CameraErrorDetails,
+  PermissionStepStatus,
+  requestMobileInertialSensorsPermission,
+  unlockAudioAndHapticsOnGesture,
+} from './components/ARStartOverlay';
+import {
+  WebCameraFacingMode,
+  WebCameraStream,
+  WebCameraStreamHandle,
+} from './components/WebCameraStream';
+import {
+  ARWebCanvasOverlay,
+  WebGyroState,
+} from './components/ARWebCanvasOverlay';
+import {
+  useWebVisionEngine,
+  WebTrackedDetection,
+} from './hooks/useWebVisionEngine';
+import { DiagnosticsModal } from './components/DiagnosticsModal';
+import {
+  AR_THEMES,
+  AR_THEME_ORDER,
+  ARThemeId,
+} from './config/ARThemeConfig';
+import {
   GyroStabilizationTelemetry,
   PipelineMetrics,
   PipelineSettings,
+  TargetClass,
   TimeSeriesPoint,
   TrackedObject,
 } from './engine/cvTypes';
-import {
-  ByteTrackLite,
-  classifySceneDensity,
-  countByBucket,
-  decodeProposalsToScreen,
-} from './engine/postprocess';
-import {
-  RenderedSimEntity,
-  WebcamMotionExtractor,
-  generateSimulatedProposals,
-} from './engine/sceneSimulation';
-import { MobileVisionViewport } from './components/MobileVisionViewport';
-import { DiagnosticsModal } from './components/DiagnosticsModal';
-import { AdaptiveThermalController, PipelineProfiler } from './utils/pipelineThermal';
-import { AR_THEME_ORDER } from './config/ARThemeConfig';
+import { AdaptiveThermalController } from './utils/pipelineThermal';
 
 const INITIAL_SETTINGS: PipelineSettings = {
-  confidenceThreshold: 0.45,
+  confidenceThreshold: 0.40,
   nmsIouThreshold: 0.45,
-  cameraMode: 'rear-crosswalk',
+  cameraMode: 'webcam',
   delegate: 'coreml-metal',
   thermalControlMode: 'auto',
   arTheme: 'tactical',
@@ -37,221 +58,164 @@ const INITIAL_SETTINGS: PipelineSettings = {
   isRunning: true,
 };
 
-const INITIAL_METRICS: PipelineMetrics = {
-  fps: 38.8,
-  theoreticalFps: 38.8,
-  realFps: 38.8,
-  thermalMode: 'Ultra',
-  rollingAvgMs: 25.8,
-  rawProposalsCount: 14,
-  postNmsCount: 7,
-  suppressedCount: 7,
-  density: 'Moderate',
-  sceneLabel: 'Urban',
-  timings: {
-    captureMs: 1.6,
-    preprocessMs: 1.9,
-    yoloMs: 11.4,
-    poseMs: 7.7,
-    nmsTrackMs: 1.4,
-    renderMs: 1.8,
-    totalMs: 25.8,
-  },
-  letterbox: { scale: 0.5, padX: 0, padY: 80 },
-};
-
-const INITIAL_GYRO: GyroStabilizationTelemetry = {
-  omegaX: 0.0,
-  omegaY: 0.0,
-  omegaZ: 0.0,
-  offsetX: 0.0,
-  offsetY: 0.0,
-  activeHz: 60,
-  lastResetAgoMs: 0,
-};
+function mapCocoNameToTargetClass(name: string): TargetClass {
+  const n = name.toLowerCase();
+  if (n === 'person') return 'person';
+  if (n === 'car') return 'car';
+  if (n === 'bus' || n === 'train') return 'bus';
+  if (n === 'truck' || n === 'boat' || n === 'airplane') return 'truck';
+  if (n === 'bicycle') return 'bicycle';
+  if (n === 'motorcycle') return 'motorcycle';
+  if (
+    n === 'dog' ||
+    n === 'cat' ||
+    n === 'bird' ||
+    n === 'horse' ||
+    n === 'sheep' ||
+    n === 'cow' ||
+    n === 'elephant' ||
+    n === 'bear' ||
+    n === 'zebra' ||
+    n === 'giraffe'
+  ) {
+    return 'dog';
+  }
+  return 'backpack';
+}
 
 export default function App() {
   const [settings, setSettings] = useState<PipelineSettings>(INITIAL_SETTINGS);
-  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
-
-  const [tracks, setTracks] = useState<TrackedObject[]>([]);
-  const [modalTracks, setModalTracks] = useState<TrackedObject[]>([]);
-  const [entities, setEntities] = useState<RenderedSimEntity[]>([]);
-  const [stats, setStats] = useState<CategoryStats>({
-    persons: 0,
-    vehicles: 0,
-    bicycles: 0,
-    animalsOther: 0,
-    deltaPersons: 0,
-    deltaVehicles: 0,
-    deltaBicycles: 0,
-    deltaAnimalsOther: 0,
+  const [arStarted, setArStarted] = useState(false);
+  const [facingMode, setFacingMode] = useState<WebCameraFacingMode>('environment');
+  const [isSwitchingCamera, setIsSwitchingCamera] = useState(false);
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const [cameraError, setCameraError] = useState<CameraErrorDetails | null>(null);
+  const [permissionStatus, setPermissionStatus] = useState<PermissionStepStatus>({
+    imu: 'idle',
+    camera: 'idle',
+    engine: 'loading',
   });
-  const [metrics, setMetrics] = useState<PipelineMetrics>(INITIAL_METRICS);
-  const [gyroTelemetry, setGyroTelemetry] = useState<GyroStabilizationTelemetry>(INITIAL_GYRO);
+
+  const [viewportSize, setViewportSize] = useState<{ width: number; height: number }>(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth : 412,
+    height: typeof window !== 'undefined' ? window.innerHeight : 840,
+  }));
+
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [radarExpanded, setRadarExpanded] = useState(true);
+  const [showFullHeatmapOverlay, setShowFullHeatmapOverlay] = useState(false);
+  const [heatmapPoints, setHeatmapPoints] = useState<
+    Array<{ xNorm: number; yNorm: number; weight: number }>
+  >([]);
   const [latencyHistory, setLatencyHistory] = useState<number[]>(() =>
-    Array.from({ length: 32 }, () => 24.5 + Math.random() * 3.5)
+    Array.from({ length: 32 }, () => 19.5)
   );
   const [timeSeries, setTimeSeries] = useState<TimeSeriesPoint[]>(() =>
     Array.from({ length: 20 }, (_, idx) => ({
       timestampLabel: `-${20 - idx}s`,
       secondIndex: idx,
-      persons: 3,
-      vehicles: 3,
-      bicycles: 1,
+      persons: 0,
+      vehicles: 0,
+      bicycles: 0,
     }))
   );
-  const [heatmapPoints, setHeatmapPoints] = useState<
-    Array<{ xNorm: number; yNorm: number; weight: number }>
-  >([]);
-  const [webcamError, setWebcamError] = useState<string | null>(null);
-
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-  const diagnosticsOpenRef = useRef(diagnosticsOpen);
-  diagnosticsOpenRef.current = diagnosticsOpen;
-
-  const viewportSizeRef = useRef({ width: 412, height: 840 });
-  const tracksRef = useRef<TrackedObject[]>([]);
-  // Diccionario LERP por trackId para suavizar transición al reiniciar offset de giroscopio
-  const lerpedTracksRef = useRef<Map<number, TrackedObject>>(new Map());
-  const trackerRef = useRef(new ByteTrackLite(18, 0.55, 0.25));
-  const profilerRef = useRef(new PipelineProfiler(0.18));
-  const thermalRef = useRef(new AdaptiveThermalController());
-  const prevCountsRef = useRef({ persons: 3, vehicles: 3, bicycles: 1, animalsOther: 1 });
-  const frameIndexRef = useRef(0);
-  const lastInferenceTimeRef = useRef(performance.now());
-  const lastMetricPushRef = useRef(performance.now());
-  const lastSeriesSecondRef = useRef(performance.now());
-
-  // Estado reactivo del giroscopio a 60Hz (inter-frame offset entre inferencias YOLO)
-  const gyroStateRef = useRef({
-    omegaX: 0, // rad/s Pitch
-    omegaY: 0, // rad/s Yaw
-    omegaZ: 0, // rad/s Roll
-    offsetX: 0, // Píxeles acumulados entre inferencias
+  const [gyroTelemetry, setGyroTelemetry] = useState<GyroStabilizationTelemetry>({
+    omegaX: 0,
+    omegaY: 0,
+    omegaZ: 0,
+    offsetX: 0,
     offsetY: 0,
-    manualImpulseX: 0,
-    manualImpulseY: 0,
-    lastSampleMs: performance.now(),
-    lastResetMs: performance.now(),
+    activeHz: 60,
+    lastResetAgoMs: 0,
   });
 
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const webcamExtractorRef = useRef<WebcamMotionExtractor | null>(null);
+  const cameraRef = useRef<WebCameraStreamHandle | null>(null);
+  const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const thermalControllerRef = useRef(new AdaptiveThermalController());
+  const pointerDragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
+    active: false,
+    lastX: 0,
+    lastY: 0,
+  });
 
-  // Gestión de Webcam en vivo
+  // Estado compartido a 60Hz para estabilización por giroscopio (devicemotion / deviceorientation)
+  const gyroStateRef = useRef<WebGyroState>({
+    omegaX: 0,
+    omegaY: 0,
+    omegaZ: 0,
+    offsetX: 0,
+    offsetY: 0,
+    hasHardwareSensor: false,
+  });
+
+  // Medir cambios de tamaño y orientación del navegador móvil (100vw x 100dvh)
   useEffect(() => {
-    let activeStream: MediaStream | null = null;
-    if (settings.cameraMode === 'webcam') {
-      setWebcamError(null);
-      if (!webcamExtractorRef.current) {
-        webcamExtractorRef.current = new WebcamMotionExtractor();
-      }
-      navigator.mediaDevices
-        ?.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 360 }, facingMode: 'user' },
-          audio: false,
-        })
-        .then((stream) => {
-          activeStream = stream;
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream;
-            videoRef.current.play().catch(() => {});
-          }
-        })
-        .catch(() => {
-          setWebcamError('Permiso denegado — usando simulación sintética en tiempo real.');
-        });
-    } else if (videoRef.current && videoRef.current.srcObject) {
-      const oldStream = videoRef.current.srcObject as MediaStream;
-      oldStream.getTracks().forEach((t) => t.stop());
-      videoRef.current.srcObject = null;
-    }
-
-    return () => {
-      if (activeStream) {
-        activeStream.getTracks().forEach((t) => t.stop());
-      }
+    const updateViewport = () => {
+      setViewportSize({
+        width: Math.max(280, window.innerWidth),
+        height: Math.max(320, window.innerHeight),
+      });
     };
-  }, [settings.cameraMode]);
+    updateViewport();
+    window.addEventListener('resize', updateViewport);
+    window.addEventListener('orientationchange', updateViewport);
+    return () => {
+      window.removeEventListener('resize', updateViewport);
+      window.removeEventListener('orientationchange', updateViewport);
+    };
+  }, []);
 
-  // 1. Bucle de Giroscopio a 60Hz (16ms) — Estabilización Inercial Inter-Frame + LERP
-  useEffect(() => {
-    const interval = window.setInterval(() => {
-      const now = performance.now();
-      const g = gyroStateRef.current;
-      const dtSec = Math.min(0.05, Math.max(0.005, (now - g.lastSampleMs) / 1000));
-      g.lastSampleMs = now;
-
-      if (!settingsRef.current.isRunning || !settingsRef.current.enableGyro) {
-        g.offsetX *= 0.7;
-        g.offsetY *= 0.7;
-        g.omegaX *= 0.7;
-        g.omegaY *= 0.7;
-        return;
-      }
-
-      // Micro-oscilación fisiológica de mano + impulsos de paneo del usuario en el visor
-      const tSec = now * 0.001;
-      const handTremorYaw = Math.sin(tSec * 2.4) * 0.09 + Math.cos(tSec * 5.1) * 0.04;
-      const handTremorPitch = Math.cos(tSec * 1.9) * 0.07 + Math.sin(tSec * 4.3) * 0.03;
-
-      g.omegaY = handTremorYaw + g.manualImpulseX;
-      g.omegaX = handTremorPitch + g.manualImpulseY;
-      g.omegaZ = Math.sin(tSec * 1.3) * 0.02;
-
-      // Decaimiento suave del impulso manual
-      g.manualImpulseX *= 0.86;
-      g.manualImpulseY *= 0.86;
-
-      // Ganancia focal (píxeles por radián para lente 1x ~62° FOV)
-      const focalPx = viewportSizeRef.current.width * 0.82;
-      g.offsetX = Math.max(-72, Math.min(72, (g.offsetX - g.omegaY * dtSec * focalPx) * 0.94));
-      g.offsetY = Math.max(-72, Math.min(72, (g.offsetY + g.omegaX * dtSec * focalPx) * 0.94));
-
-      // Interpolación Lineal (LERP) a 60 FPS hacia las coordenadas reales de YOLO
-      const rawTargets = tracksRef.current;
-      if (rawTargets.length > 0) {
-        const lerpAlpha = 0.36;
-        const lerpedList: TrackedObject[] = rawTargets.map((target) => {
-          const prev = lerpedTracksRef.current.get(target.trackId);
-          if (!prev) {
-            lerpedTracksRef.current.set(target.trackId, target);
-            return target;
-          }
-
-          const smoothBox = {
-            x: prev.screenBox.x + (target.screenBox.x - prev.screenBox.x) * lerpAlpha,
-            y: prev.screenBox.y + (target.screenBox.y - prev.screenBox.y) * lerpAlpha,
-            width: prev.screenBox.width + (target.screenBox.width - prev.screenBox.width) * lerpAlpha,
-            height: prev.screenBox.height + (target.screenBox.height - prev.screenBox.height) * lerpAlpha,
-          };
-
-          const smoothKeypoints = target.keypoints.map((kp, idx) => {
-            const pKp = prev.keypoints[idx];
-            if (!pKp) return kp;
-            return {
-              ...kp,
-              x: pKp.x + (kp.x - pKp.x) * lerpAlpha,
-              y: pKp.y + (kp.y - pKp.y) * lerpAlpha,
-            };
-          });
-
-          const updated: TrackedObject = {
-            ...target,
-            screenBox: smoothBox,
-            centerX: smoothBox.x + smoothBox.width * 0.5,
-            centerY: smoothBox.y + smoothBox.height * 0.5,
-            keypoints: smoothKeypoints,
-          };
-          lerpedTracksRef.current.set(target.trackId, updated);
-          return updated;
+  // Callback ejecutado por cada frame con detecciones reales
+  const handleNewInferenceFrame = useCallback(
+    (newDetections: WebTrackedDetection[]) => {
+      if (newDetections.length > 0 && viewportSize.width > 0 && viewportSize.height > 0) {
+        setHeatmapPoints((prev) => {
+          const additions = newDetections.map((d) => ({
+            xNorm: Math.min(1, Math.max(0, d.centerX / viewportSize.width)),
+            yNorm: Math.min(1, Math.max(0, d.centerY / viewportSize.height)),
+            weight: d.category === 'person' ? 1.0 : 0.78,
+          }));
+          return [...prev, ...additions].slice(-180);
         });
-
-        setTracks(lerpedList);
       }
+    },
+    [viewportSize.width, viewportSize.height]
+  );
 
+  // 3. Motor de Inferencia Real (WebGPU -> WebGL -> WASM) + 80 Clases COCO + 17 Keypoints
+  const {
+    isEngineReady,
+    engineStatusText,
+    activeBackend,
+    detections,
+    counts,
+    timings,
+    letterboxMeta,
+  } = useWebVisionEngine({
+    videoElement,
+    isCameraActive: arStarted && Boolean(videoElement),
+    isFrontCamera: facingMode === 'user',
+    screenWidth: viewportSize.width,
+    screenHeight: viewportSize.height,
+    confidenceThreshold: settings.confidenceThreshold,
+    nmsIouThreshold: settings.nmsIouThreshold,
+    enablePose: settings.enablePose,
+    isPaused: !settings.isRunning,
+    onNewInferenceFrame: handleNewInferenceFrame,
+  });
+
+  useEffect(() => {
+    setPermissionStatus((prev) => ({
+      ...prev,
+      engine: isEngineReady ? 'ready' : 'loading',
+    }));
+  }, [isEngineReady]);
+
+  // Actualizar telemetría de giroscopio y series temporales de 20s
+  useEffect(() => {
+    if (!arStarted) return;
+    const timer = window.setInterval(() => {
+      const g = gyroStateRef.current;
       setGyroTelemetry({
         omegaX: g.omegaX,
         omegaY: g.omegaY,
@@ -259,319 +223,517 @@ export default function App() {
         offsetX: g.offsetX,
         offsetY: g.offsetY,
         activeHz: 60,
-        lastResetAgoMs: Math.round(now - g.lastResetMs),
+        lastResetAgoMs: Math.round(timings.totalMs),
       });
-    }, 16);
+      setLatencyHistory((prev) => [...prev.slice(1), timings.totalMs]);
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [arStarted, timings.totalMs]);
 
-    return () => window.clearInterval(interval);
-  }, []);
-
-  // 2. Bucle de Inferencia YOLOv8n + MoveNet + ByteTrack + Gobernador Térmico
   useEffect(() => {
-    let rafId: number;
+    if (!arStarted) return;
+    const secTimer = window.setInterval(() => {
+      setTimeSeries((prev) => {
+        const nextIdx = (prev[prev.length - 1]?.secondIndex ?? 0) + 1;
+        const updated = [
+          ...prev.slice(1),
+          {
+            timestampLabel: 'now',
+            secondIndex: nextIdx,
+            persons: counts.persons,
+            vehicles: counts.vehicles,
+            bicycles: counts.animals + counts.objects,
+          },
+        ];
+        return updated.map((pt, idx) => ({
+          ...pt,
+          timestampLabel: idx === updated.length - 1 ? 'now' : `-${updated.length - 1 - idx}s`,
+        }));
+      });
+    }, 1000);
+    return () => window.clearInterval(secTimer);
+  }, [arStarted, counts]);
 
-    const tick = (now: number) => {
-      const currentSettings = settingsRef.current;
+  // Dibujar Mini-Radar espacial en esquina inferior derecha
+  useEffect(() => {
+    const rCanvas = radarCanvasRef.current;
+    if (!rCanvas || !radarExpanded || !arStarted) return;
+    const ctx = rCanvas.getContext('2d');
+    if (!ctx) return;
 
-      if (currentSettings.isRunning) {
-        const delegateFactor =
-          currentSettings.delegate === 'coreml-metal'
-            ? 1.0
-            : currentSettings.delegate === 'nnapi-gpu'
-            ? 1.25
-            : 2.35;
+    const w = rCanvas.width;
+    const h = rCanvas.height;
+    ctx.clearRect(0, 0, w, h);
 
-        const baseCaptureMs = 1.5;
-        const basePreprocessMs = 1.9;
-        const baseYoloMs = (10.8 + (currentSettings.crowdBoost ? 2.4 : 0)) * delegateFactor;
+    const activeTheme = AR_THEMES[settings.arTheme] ?? AR_THEMES.tactical;
 
-        const estWithoutPose = baseCaptureMs + basePreprocessMs + baseYoloMs + 3.0;
-        const autoThermal = thermalRef.current.evaluate(
-          estWithoutPose + (currentSettings.enablePose ? 7.4 * delegateFactor : 0)
-        );
+    ctx.strokeStyle =
+      settings.arTheme === 'industrial'
+        ? 'rgba(250, 204, 21, 0.24)'
+        : 'rgba(56, 189, 248, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(w * 0.5, h * 0.88, w * 0.36, Math.PI, 0);
+    ctx.arc(w * 0.5, h * 0.88, w * 0.68, Math.PI, 0);
+    ctx.moveTo(w * 0.5, 0);
+    ctx.lineTo(w * 0.5, h);
+    ctx.moveTo(0, h * 0.5);
+    ctx.lineTo(w, h * 0.5);
+    ctx.stroke();
 
-        const activeThermalMode =
-          currentSettings.thermalControlMode === 'auto'
-            ? autoThermal.mode
-            : currentSettings.thermalControlMode;
+    for (const pt of heatmapPoints.slice(-80)) {
+      const px = pt.xNorm * w;
+      const py = pt.yNorm * h;
+      const rad = 10;
+      const grad = ctx.createRadialGradient(px, py, 1, px, py, rad);
+      grad.addColorStop(0, 'rgba(249, 115, 22, 0.34)');
+      grad.addColorStop(0.6, 'rgba(56, 189, 248, 0.14)');
+      grad.addColorStop(1, 'rgba(56, 189, 248, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(px, py, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
-        const targetIntervalMs = Math.max(24, estWithoutPose);
-        if (now - lastInferenceTimeRef.current >= targetIntervalMs) {
-          lastInferenceTimeRef.current = now;
-          frameIndexRef.current += 1;
-          const frameIdx = frameIndexRef.current;
+    for (const det of detections) {
+      const col = activeTheme.categories[det.category]?.stroke ?? '#38BDF8';
+      const bx = Math.max(4, Math.min(w - 4, (det.centerX / Math.max(1, viewportSize.width)) * w));
+      const by = Math.max(4, Math.min(h - 4, (det.centerY / Math.max(1, viewportSize.height)) * h));
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(bx, by, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }, [heatmapPoints, detections, radarExpanded, arStarted, settings.arTheme, viewportSize]);
 
-          const shouldRunPose =
-            currentSettings.enablePose &&
-            (activeThermalMode === 'Ultra' ||
-              (activeThermalMode === 'Balanced' && frameIdx % 2 === 0));
+  /**
+   * 1. Secuencia obligatoria activada por el gesto onClick de "Iniciar Cámara AR":
+   *    (a) Permiso explícito de DeviceMotionEvent / DeviceOrientationEvent en iOS 13+
+   *    (b) Solicitud de cámara física navigator.mediaDevices.getUserMedia + videoElement.play()
+   *    (c) Desbloqueo de contexto de audio/vibración y transición al HUD AR en vivo
+   */
+  const handleStartARCamera = useCallback(async () => {
+    setCameraError(null);
 
-          const shouldUpdateHeatmap =
-            activeThermalMode !== 'Thermal Safe' || frameIdx % 4 === 0;
+    // Paso 1: Permiso de sensores inerciales (iOS 13+ Safari requiere que ocurra en el gesto del usuario)
+    setPermissionStatus((prev) => ({ ...prev, imu: 'requesting' }));
+    const imuResult = await requestMobileInertialSensorsPermission();
+    setPermissionStatus((prev) => ({ ...prev, imu: imuResult }));
 
-          const srcWidth = 640;
-          const srcHeight = 360;
-          const vpWidth = Math.max(280, viewportSizeRef.current.width);
-          const vpHeight = Math.max(220, viewportSizeRef.current.height);
+    // Paso 2: Acceso a la cámara física y reproducción inmediata con videoElement.play()
+    setPermissionStatus((prev) => ({ ...prev, camera: 'requesting' }));
+    const videoEl = await cameraRef.current?.startStream(facingMode);
 
-          let rawProposals;
-          let renderedSim: RenderedSimEntity[] = [];
+    if (!videoEl) {
+      setPermissionStatus((prev) => ({ ...prev, camera: 'denied' }));
+      return;
+    }
 
-          if (
-            currentSettings.cameraMode === 'webcam' &&
-            videoRef.current &&
-            videoRef.current.readyState >= 2 &&
-            webcamExtractorRef.current
-          ) {
-            rawProposals = webcamExtractorRef.current.extractProposals(
-              videoRef.current,
-              now * 0.001
-            );
-          } else {
-            const simMode =
-              currentSettings.cameraMode === 'webcam'
-                ? 'rear-crosswalk'
-                : currentSettings.cameraMode;
-            const simResult = generateSimulatedProposals(
-              simMode,
-              now * 0.001,
-              currentSettings.crowdBoost,
-              vpWidth,
-              vpHeight
-            );
-            rawProposals = simResult.proposals;
-            renderedSim = simResult.entities;
-          }
+    // Paso 3: Desbloqueo de audio/vibración y transición fluida al visor AR
+    unlockAudioAndHapticsOnGesture();
+    setPermissionStatus((prev) => ({ ...prev, camera: 'granted' }));
+    setVideoElement(videoEl);
+    setArStarted(true);
+  }, [facingMode]);
 
-          const { rawFilteredCount, detections, letterbox } = decodeProposalsToScreen(
-            rawProposals,
-            currentSettings.confidenceThreshold,
-            currentSettings.nmsIouThreshold,
-            srcWidth,
-            srcHeight,
-            vpWidth,
-            vpHeight,
-            shouldRunPose,
-            currentSettings.cameraMode === 'webcam'
-          );
+  /**
+   * Alterna en vivo entre cámara trasera (environment) y frontal (user)
+   * deteniendo primero todos los tracks anteriores para evitar bloqueo de hardware en Android.
+   */
+  const handleSwitchCamera = useCallback(async () => {
+    if (!cameraRef.current || isSwitchingCamera) return;
+    setIsSwitchingCamera(true);
+    try {
+      const nextFacing = await cameraRef.current.switchCamera();
+      setFacingMode(nextFacing);
+      setHeatmapPoints([]);
+    } finally {
+      setIsSwitchingCamera(false);
+    }
+  }, [isSwitchingCamera]);
 
-          const activeTracks = trackerRef.current.update(detections);
-          tracksRef.current = activeTracks;
-          setEntities(renderedSim);
+  const handleStreamReady = useCallback(
+    (video: HTMLVideoElement, actualFacing: WebCameraFacingMode) => {
+      setVideoElement(video);
+      setFacingMode(actualFacing);
+      setCameraError(null);
+    },
+    []
+  );
 
-          // REINICIO SINCRONIZADO DEL GIROSCOPIO:
-          // Al llegar una nueva inferencia de YOLO, las cajas reales ya reflejan la nueva pose
-          // de la cámara; amortiguamos el offset inter-frame a 0 mientras el LERP absorbe el cambio.
-          gyroStateRef.current.offsetX *= 0.18;
-          gyroStateRef.current.offsetY *= 0.18;
-          gyroStateRef.current.lastResetMs = now;
-
-          if (shouldUpdateHeatmap && activeTracks.length > 0) {
-            setHeatmapPoints((prev) => {
-              const additions = activeTracks.map((tr) => ({
-                xNorm: Math.min(1, Math.max(0, tr.centerX / vpWidth)),
-                yNorm: Math.min(1, Math.max(0, tr.centerY / vpHeight)),
-                weight: tr.className === 'person' ? 1.0 : 0.75,
-              }));
-              return [...prev, ...additions].slice(-200);
-            });
-          }
-
-          // Throttler de 250 ms hacia estado React del HUD
-          if (now - lastMetricPushRef.current >= 250) {
-            lastMetricPushRef.current = now;
-
-            const jitter = () => (Math.random() - 0.5) * 0.35;
-            const captureMs = Math.max(0.8, baseCaptureMs + jitter() * 0.3);
-            const preprocessMs = Math.max(1.1, basePreprocessMs + jitter() * 0.3);
-            const yoloMs = Math.max(4.5, baseYoloMs + jitter());
-            const poseMs = shouldRunPose
-              ? Math.max(2.5, (7.1 + activeTracks.length * 0.3) * delegateFactor + jitter())
-              : 0;
-            const nmsTrackMs = Math.max(0.5, 1.2 + rawFilteredCount * 0.04 + jitter() * 0.2);
-            const renderMs = Math.max(0.9, 1.6 + activeTracks.length * 0.08 + jitter() * 0.2);
-
-            const ema = profilerRef.current.recordFrame(
-              captureMs,
-              preprocessMs,
-              yoloMs,
-              poseMs,
-              nmsTrackMs,
-              renderMs,
-              now
-            );
-
-            const buckets = countByBucket(activeTracks);
-            const density = classifySceneDensity(activeTracks.length);
-
-            setStats({
-              persons: buckets.persons,
-              vehicles: buckets.vehicles,
-              bicycles: buckets.bicycles,
-              animalsOther: buckets.animalsOther,
-              deltaPersons: buckets.persons - prevCountsRef.current.persons,
-              deltaVehicles: buckets.vehicles - prevCountsRef.current.vehicles,
-              deltaBicycles: buckets.bicycles - prevCountsRef.current.bicycles,
-              deltaAnimalsOther: buckets.animalsOther - prevCountsRef.current.animalsOther,
-            });
-
-            if (diagnosticsOpenRef.current) {
-              setModalTracks(activeTracks);
-            }
-
-            setMetrics({
-              fps: Number(ema.realFps.toFixed(1)),
-              theoreticalFps: Number(ema.theoreticalFps.toFixed(1)),
-              realFps: Number(ema.realFps.toFixed(1)),
-              thermalMode: activeThermalMode,
-              rollingAvgMs: Number(autoThermal.rollingAvgMs.toFixed(1)),
-              rawProposalsCount: rawFilteredCount,
-              postNmsCount: detections.length,
-              suppressedCount: Math.max(0, rawFilteredCount - detections.length),
-              density,
-              sceneLabel:
-                currentSettings.cameraMode === 'rear-crosswalk'
-                  ? 'Urban'
-                  : currentSettings.cameraMode === 'bike-boulevard'
-                  ? 'Transit'
-                  : 'Live Cam',
-              timings: {
-                captureMs: Number(ema.captureMs.toFixed(1)),
-                preprocessMs: Number(ema.resizeMs.toFixed(1)),
-                yoloMs: Number(ema.yoloMs.toFixed(1)),
-                poseMs: Number(ema.poseMs.toFixed(1)),
-                nmsTrackMs: Number(ema.nmsTrackMs.toFixed(1)),
-                renderMs: Number(ema.skiaRenderMs.toFixed(1)),
-                totalMs: Number(ema.totalMs.toFixed(1)),
-              },
-              letterbox: {
-                scale: Number(letterbox.scale.toFixed(3)),
-                padX: Math.round(letterbox.padX),
-                padY: Math.round(letterbox.padY),
-              },
-            });
-
-            setLatencyHistory((prev) => [
-              ...prev.slice(1),
-              Number(ema.totalMs.toFixed(1)),
-            ]);
-          }
-
-          if (now - lastSeriesSecondRef.current >= 1000) {
-            lastSeriesSecondRef.current = now;
-            const buckets = countByBucket(activeTracks);
-            prevCountsRef.current = buckets;
-
-            setTimeSeries((prev) => {
-              const nextIdx = (prev[prev.length - 1]?.secondIndex ?? 0) + 1;
-              const updated = [
-                ...prev.slice(1),
-                {
-                  timestampLabel: 'now',
-                  secondIndex: nextIdx,
-                  persons: buckets.persons,
-                  vehicles: buckets.vehicles,
-                  bicycles: buckets.bicycles,
-                },
-              ];
-              return updated.map((pt, idx) => ({
-                ...pt,
-                timestampLabel: idx === updated.length - 1 ? 'now' : `-${updated.length - 1 - idx}s`,
-              }));
-            });
-          }
-        }
-      }
-
-      rafId = requestAnimationFrame(tick);
-    };
-
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  }, []);
-
-  const handleUpdateSettings = useCallback((patch: Partial<PipelineSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...patch };
-      if (patch.cameraMode && patch.cameraMode !== prev.cameraMode) {
-        trackerRef.current.reset();
-        lerpedTracksRef.current.clear();
-        setHeatmapPoints([]);
-      }
-      return next;
-    });
+  const handleStreamError = useCallback((err: CameraErrorDetails) => {
+    setCameraError(err);
+    setPermissionStatus((prev) => ({ ...prev, camera: 'denied' }));
   }, []);
 
   const handleCycleARTheme = useCallback(() => {
     setSettings((prev) => {
       const idx = AR_THEME_ORDER.indexOf(prev.arTheme);
-      const nextTheme: ARVisualTheme = AR_THEME_ORDER[(idx + 1) % AR_THEME_ORDER.length];
+      const nextTheme: ARThemeId = AR_THEME_ORDER[(idx + 1) % AR_THEME_ORDER.length];
       return { ...prev, arTheme: nextTheme };
     });
   }, []);
 
-  // Permite simular un giro rápido de cámara (Yaw/Pitch) al arrastrar o mover sobre el visor
-  const handleSimulateGyroImpulse = useCallback((deltaYawRadS: number, deltaPitchRadS: number) => {
-    gyroStateRef.current.manualImpulseX = Math.max(
-      -2.2,
-      Math.min(2.2, gyroStateRef.current.manualImpulseX + deltaYawRadS)
-    );
-    gyroStateRef.current.manualImpulseY = Math.max(
-      -2.2,
-      Math.min(2.2, gyroStateRef.current.manualImpulseY + deltaPitchRadS)
-    );
-  }, []);
-
-  const handleViewportResize = useCallback((width: number, height: number) => {
-    viewportSizeRef.current = { width, height };
+  const handleUpdateSettings = useCallback((patch: Partial<PipelineSettings>) => {
+    setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
   const handleResetHeatmap = useCallback(() => {
     setHeatmapPoints([]);
   }, []);
 
-  const handleOpenDiagnostics = useCallback(() => {
-    setModalTracks(tracksRef.current);
-    setDiagnosticsOpen(true);
-  }, []);
+  // Soporte táctil/arrastre para probar estabilización inercial también en navegadores de escritorio sin giroscopio
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).closest('button')) return;
+    pointerDragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
+  };
 
-  const handleCloseDiagnostics = useCallback(() => {
-    setDiagnosticsOpen(false);
-  }, []);
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointerDragRef.current.active || !settings.enableGyro) return;
+    const dx = e.clientX - pointerDragRef.current.lastX;
+    const dy = e.clientY - pointerDragRef.current.lastY;
+    pointerDragRef.current.lastX = e.clientX;
+    pointerDragRef.current.lastY = e.clientY;
+
+    const g = gyroStateRef.current;
+    g.omegaY = -dx * 0.04;
+    g.omegaX = dy * 0.04;
+    g.offsetX = Math.max(-64, Math.min(64, g.offsetX + dx * 0.65));
+    g.offsetY = Math.max(-64, Math.min(64, g.offsetY + dy * 0.65));
+  };
+
+  const handlePointerUp = () => {
+    pointerDragRef.current.active = false;
+  };
+
+  // Adaptar métricas y tracks para el modal de diagnóstico y telemetría
+  const autoThermal = thermalControllerRef.current.evaluate(timings.totalMs);
+  const activeThermalMode =
+    settings.thermalControlMode === 'auto' ? autoThermal.mode : settings.thermalControlMode;
+
+  const densityLabel =
+    counts.total < 3 ? 'Low' : counts.total <= 7 ? 'Moderate' : 'High';
+
+  const modalMetrics: PipelineMetrics = {
+    fps: timings.fps,
+    theoreticalFps: Number(Math.min(60, 1000 / Math.max(4, timings.totalMs)).toFixed(1)),
+    realFps: timings.fps,
+    thermalMode: activeThermalMode,
+    rollingAvgMs: Number(autoThermal.rollingAvgMs.toFixed(1)),
+    rawProposalsCount: counts.total,
+    postNmsCount: counts.total,
+    suppressedCount: 0,
+    density: densityLabel,
+    sceneLabel: facingMode === 'environment' ? 'Rear AR' : 'Front AR',
+    timings: {
+      captureMs: timings.captureMs,
+      preprocessMs: timings.preprocessMs,
+      yoloMs: timings.inferenceMs,
+      poseMs: settings.enablePose && counts.persons > 0 ? Number((timings.postprocessMs * 0.6).toFixed(1)) : 0,
+      nmsTrackMs: timings.postprocessMs,
+      renderMs: 1.4,
+      totalMs: timings.totalMs,
+    },
+    letterbox: {
+      scale: Number(letterboxMeta.scale.toFixed(3)),
+      padX: letterboxMeta.padX,
+      padY: letterboxMeta.padY,
+    },
+  };
+
+  const modalTracks: TrackedObject[] = detections.map((d) => ({
+    trackId: d.trackId,
+    classId: d.classId,
+    className: mapCocoNameToTargetClass(d.className),
+    confidence: d.confidence,
+    screenBox: d.screenBox,
+    keypoints: d.keypoints,
+    age: d.age,
+    lostFrames: d.lostFrames,
+    vx: d.vx,
+    vy: d.vy,
+    centerX: d.centerX,
+    centerY: d.centerY,
+  }));
+
+  const activeThemeSpec = AR_THEMES[settings.arTheme] ?? AR_THEMES.tactical;
+  const glassStyle: React.CSSProperties = {
+    backgroundColor: 'rgba(11, 15, 23, 0.58)',
+    borderColor: activeThemeSpec.hudBorderColor,
+  };
 
   return (
-    <div className="h-dvh w-full overflow-hidden bg-[#0B0F17] text-[#F8FAFC] select-none relative">
-      {/* Visor AR 100% Edge-to-Edge a Pantalla Completa (StyleSheet.absoluteFill) + HUD Flotante Glassmorphism */}
-      <MobileVisionViewport
-        settings={settings}
-        metrics={metrics}
-        stats={stats}
-        tracks={tracks}
-        entities={entities}
-        heatmapPoints={heatmapPoints}
-        gyroTelemetry={gyroTelemetry}
-        videoRef={videoRef}
-        webcamError={webcamError}
-        onViewportResize={handleViewportResize}
-        onUpdateSettings={handleUpdateSettings}
-        onCycleARTheme={handleCycleARTheme}
-        onSimulateGyroImpulse={handleSimulateGyroImpulse}
-        onOpenDiagnostics={handleOpenDiagnostics}
-        onResetHeatmap={handleResetHeatmap}
+    <div
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      className="relative w-screen h-dvh overflow-hidden bg-[#06090F] text-[#F8FAFC] select-none"
+    >
+      {/* 1. Stream de Cámara Física Real (100vw x 100dvh, object-fit: cover, playsInline) */}
+      <WebCameraStream
+        ref={cameraRef}
+        facingMode={facingMode}
+        onStreamReady={handleStreamReady}
+        onStreamError={handleStreamError}
       />
 
-      {/* Bottom Sheet de Ajustes, Telemetría Avanzada (Gráfica 20s, Latencia EMA, Tabla ByteTrack y Código RN) */}
+      {/* 2. Lienzo AR HTML5 Escalado con devicePixelRatio + LERP + Sensores Giroscopio */}
+      <ARWebCanvasOverlay
+        detections={detections}
+        arTheme={settings.arTheme}
+        enablePose={settings.enablePose}
+        enableGyro={settings.enableGyro}
+        showHeatmapOverlay={showFullHeatmapOverlay}
+        heatmapPoints={heatmapPoints}
+        screenWidth={viewportSize.width}
+        screenHeight={viewportSize.height}
+        gyroStateRef={gyroStateRef}
+      />
+
+      {/* 3. Pantalla Inicial Inmersiva con Botón Flotante "Iniciar Cámara AR" */}
+      <ARStartOverlay
+        visible={!arStarted || Boolean(cameraError)}
+        engineStatusText={engineStatusText}
+        activeBackend={activeBackend}
+        permissionStatus={permissionStatus}
+        errorDetails={cameraError}
+        onStartARCamera={handleStartARCamera}
+      />
+
+      {/* 4. HUD Flotante Translúcido en Vivo (Visible cuando la cámara AR está activa) */}
+      {arStarted && !cameraError && (
+        <>
+          {/* Barra Superior Flotante */}
+          <div className="fixed top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
+            {/* Estado LIVE AR + FPS + Backend activo (WebGPU / WebGL / WASM) */}
+            <div
+              style={glassStyle}
+              className="pointer-events-auto min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border flex items-center gap-2 shadow-lg"
+            >
+              <span className="w-2 h-2 rounded-full bg-[#22C55E]" />
+              <span className="text-xs font-bold tracking-wide text-slate-100 whitespace-nowrap">
+                LIVE AR
+              </span>
+              <span className="text-slate-500" aria-hidden="true">
+                ·
+              </span>
+              <span className="font-mono text-xs font-bold text-sky-400 tabular-nums whitespace-nowrap">
+                {timings.fps.toFixed(1)} FPS
+              </span>
+              <span className="text-slate-500 hidden sm:inline" aria-hidden="true">
+                ·
+              </span>
+              <span className="hidden sm:inline font-mono text-[11px] text-emerald-300 uppercase">
+                {activeBackend}
+              </span>
+            </div>
+
+            {/* Botones de Acción Rápida: Estilo AR, Esqueleto 17kp y Selector Cámara Trasera/Frontal */}
+            <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap">
+              <button
+                type="button"
+                onClick={handleCycleARTheme}
+                style={glassStyle}
+                className="min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-semibold text-slate-100 hover:bg-slate-900/75 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
+              >
+                <span>Estilo: {activeThemeSpec.shortLabel}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleUpdateSettings({ enablePose: !settings.enablePose })}
+                style={glassStyle}
+                className={`min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                  settings.enablePose ? 'text-emerald-300' : 'text-slate-400'
+                }`}
+              >
+                {settings.enablePose ? (
+                  <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <EyeOff className="w-3.5 h-3.5 text-slate-400" />
+                )}
+                <span>Pose {settings.enablePose ? 'ON' : 'OFF'}</span>
+              </button>
+
+              {/* Alternar Cámara Trasera (environment) / Frontal (user) liberando tracks previos */}
+              <button
+                type="button"
+                onClick={handleSwitchCamera}
+                disabled={isSwitchingCamera}
+                style={glassStyle}
+                title="Alternar entre cámara trasera y frontal"
+                className="min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-semibold text-sky-300 hover:bg-slate-900/75 disabled:opacity-50 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
+              >
+                {isSwitchingCamera ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                ) : (
+                  <Camera className="w-3.5 h-3.5 text-sky-400" />
+                )}
+                <span>{facingMode === 'environment' ? 'Trasera (1x)' : 'Frontal'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Contadores en Vivo de las 80 Clases de COCO (Personas, Vehículos, Animales, Objetos) */}
+          <div
+            style={glassStyle}
+            className="fixed top-16 left-3 z-20 px-3.5 py-2 rounded-2xl backdrop-blur-md border flex flex-wrap items-center gap-3 text-xs shadow-md pointer-events-auto"
+          >
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-300">Personas</span>
+              <span className="font-mono font-bold text-[#38BDF8] tabular-nums">
+                {counts.persons}
+              </span>
+            </div>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-300">Vehículos</span>
+              <span className="font-mono font-bold text-[#F97316] tabular-nums">
+                {counts.vehicles}
+              </span>
+            </div>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-300">Animales</span>
+              <span className="font-mono font-bold text-[#A855F7] tabular-nums">
+                {counts.animals}
+              </span>
+            </div>
+            <span className="text-slate-600" aria-hidden="true">
+              ·
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-300">Objetos</span>
+              <span className="font-mono font-bold text-amber-300 tabular-nums">
+                {counts.objects}
+              </span>
+            </div>
+          </div>
+
+          {/* Mini-Radar / Heatmap Flotante Colapsable en Esquina Inferior Derecha */}
+          <div className="fixed bottom-16 right-3 z-20 flex flex-col items-end gap-1.5 pointer-events-auto">
+            {radarExpanded ? (
+              <div
+                style={glassStyle}
+                className="w-[156px] rounded-2xl backdrop-blur-md border p-2.5 shadow-2xl flex flex-col gap-1.5"
+              >
+                <div className="flex items-center justify-between gap-1">
+                  <div className="flex items-center gap-1.5">
+                    <Radar className="w-3.5 h-3.5 text-sky-400" />
+                    <span className="text-[11px] font-semibold text-slate-200">
+                      Radar Espacial
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setShowFullHeatmapOverlay((v) => !v)}
+                      title="Superponer mapa térmico en visor"
+                      className={`p-1 rounded-md text-[10px] transition-colors cursor-pointer ${
+                        showFullHeatmapOverlay
+                          ? 'bg-orange-500/25 text-orange-300'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Flame className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRadarExpanded(false)}
+                      className="px-1.5 py-0.5 rounded text-xs font-mono text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      —
+                    </button>
+                  </div>
+                </div>
+
+                <div className="relative w-full h-[82px] rounded-xl bg-[#070A10]/75 border border-white/10 overflow-hidden">
+                  <canvas
+                    ref={radarCanvasRef}
+                    width={136}
+                    height={82}
+                    className="w-full h-full block"
+                  />
+                  <div className="absolute bottom-1 left-1.5 right-1.5 flex items-center justify-between text-[10px] font-mono text-slate-400">
+                    <span>n={counts.total}</span>
+                    <button
+                      type="button"
+                      onClick={handleResetHeatmap}
+                      className="text-sky-400 hover:underline cursor-pointer"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setRadarExpanded(true)}
+                style={glassStyle}
+                className="min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-medium text-slate-200 hover:text-white flex items-center gap-1.5 shadow-lg cursor-pointer"
+              >
+                <Radar className="w-3.5 h-3.5 text-sky-400" />
+                <span>Radar ({counts.total})</span>
+              </button>
+            )}
+          </div>
+
+          {/* Barra Inferior Flotante */}
+          <div className="fixed bottom-3 left-3 right-3 z-20 flex items-center justify-between gap-2 pointer-events-none">
+            <button
+              type="button"
+              onClick={() => handleUpdateSettings({ enableGyro: !settings.enableGyro })}
+              style={glassStyle}
+              className="pointer-events-auto min-h-[44px] px-3.5 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 shadow-xl cursor-pointer transition-colors hover:bg-slate-900/75"
+            >
+              <Compass
+                className={`w-4 h-4 ${
+                  settings.enableGyro ? 'text-emerald-400' : 'text-slate-500'
+                }`}
+              />
+              <div className="flex flex-col items-start leading-tight">
+                <span className="text-xs font-semibold text-slate-100 whitespace-nowrap">
+                  {settings.enableGyro ? 'AR + Giroscopio Activo' : 'Giroscopio Pausado'}
+                </span>
+                <span className="text-[10.5px] font-mono text-slate-400 tabular-nums">
+                  Δx:{gyroTelemetry.offsetX >= 0 ? '+' : ''}
+                  {gyroTelemetry.offsetX.toFixed(1)}px Δy:{gyroTelemetry.offsetY >= 0 ? '+' : ''}
+                  {gyroTelemetry.offsetY.toFixed(1)}px · {timings.totalMs.toFixed(1)}ms
+                </span>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setDiagnosticsOpen(true)}
+              style={glassStyle}
+              className="pointer-events-auto min-h-[44px] px-4 rounded-2xl backdrop-blur-md border hover:bg-slate-900/80 text-slate-100 text-xs font-semibold flex items-center gap-2 shadow-xl transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 text-sky-400" />
+              <span>Ajustes y Telemetría</span>
+            </button>
+          </div>
+        </>
+      )}
+
+      {/* 5. Bottom Sheet de Ajustes, Telemetría y Explorador de Código Web/RN */}
       <DiagnosticsModal
         visible={diagnosticsOpen}
         settings={settings}
-        metrics={metrics}
+        metrics={modalMetrics}
         tracks={modalTracks}
         timeSeries={timeSeries}
         latencyHistory={latencyHistory}
         gyroTelemetry={gyroTelemetry}
         onUpdate={handleUpdateSettings}
         onResetHeatmap={handleResetHeatmap}
-        onClose={handleCloseDiagnostics}
+        onClose={() => setDiagnosticsOpen(false)}
       />
     </div>
   );

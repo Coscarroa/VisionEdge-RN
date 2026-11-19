@@ -1,6 +1,10 @@
 import visionPostProcessorRaw from '../utils/visionPostProcessor.ts?raw';
 import pipelineThermalRaw from '../utils/pipelineThermal.ts?raw';
 import arThemeConfigRaw from '../config/ARThemeConfig.ts?raw';
+import arStartOverlayRaw from '../components/ARStartOverlay.tsx?raw';
+import webCameraStreamRaw from '../components/WebCameraStream.tsx?raw';
+import useWebVisionEngineRaw from '../hooks/useWebVisionEngine.ts?raw';
+import arWebCanvasOverlayRaw from '../components/ARWebCanvasOverlay.tsx?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
 
@@ -15,44 +19,91 @@ export interface CodeFileNode {
   content: string;
 }
 
-export const RN_PROJECT_TREE = `VisionEdgeRN/
-├── App.tsx                              # Visor AR 100% Edge-to-Edge + HUD Flotante Glassmorphism + Gyro 60Hz
-├── plugins/
-│   └── withVisionEdgeNative.js          # Config Plugin CNG: aaptOptions noCompress .tflite, GPU, iOS 15.1+
-├── scripts/
-│   ├── export_tflite_colab.py           # Colab FP16 export + TFLite Interpreter inspection
-│   └── build_release_free.sh            # Compilación gratuita Android & iOS Release (sin Expo Go)
+export const RN_PROJECT_TREE = `VisionEdge-Web-And-RN/
 ├── src/
-│   ├── config/
-│   │   └── ARThemeConfig.ts             # 3 estilos visuales AR (Táctico Cian, Nativo Frosted, Industrial)
-│   ├── models/
-│   │   ├── yolo11n_fp16.tflite          # Detección 80 clases COCO (person, vehicle, bicycle, animal, object)
-│   │   ├── yolo11n_pose_fp16.tflite     # Estimación de pose (17 keypoints COCO)
-│   │   └── useVisionModels.ts           # Hook asíncrono con delegados CoreML / GPU / NNAPI
-│   ├── processors/
-│   │   └── useObjectDetectionProcessor.ts # Frame Processor JSI + resize + runSync + SharedValue + Gyro Reset
+│   ├── App.tsx                              # Visor AR Web/Móvil 100% Edge-to-Edge + HUD Flotante + Sensores
 │   ├── components/
-│   │   ├── AROverlayCanvas.tsx          # Skia AR Full-Screen + LERP + 60Hz Gyro Offset + 3 estilos AR
-│   │   ├── DetectionOverlayCanvas.tsx   # Skia PictureRecorder 60 FPS (cero re-renders)
-│   │   ├── ActivityHeatmap.tsx          # Mini-Radar / Heatmap espacial colapsable
-│   │   ├── TelemetryCharts.tsx          # Processing Speed Wave + Object Tracking 20s
-│   │   ├── LatencyBreakdownCard.tsx     # Barras EMA por etapa + Modo Térmico
-│   │   └── DiagnosticsModal.tsx         # Bottom Sheet #0F172A (Telemetría, Gráfica 20s, Tabla y Ajustes)
+│   │   ├── ARStartOverlay.tsx               # Botón flotante "Iniciar Cámara AR" + Permisos iOS 13+ IMU/WebRTC
+│   │   ├── WebCameraStream.tsx              # getUserMedia progresivo + playsInline Safari/Samsung + Switch Cam
+│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HTML5 devicePixelRatio + Letterbox->Cover + LERP + Gyro
+│   │   ├── AROverlayCanvas.tsx              # Skia AR Full-Screen (React Native) + LERP + 60Hz Gyro Offset
+│   │   ├── DetectionOverlayCanvas.tsx       # Skia PictureRecorder 60 FPS (cero re-renders)
+│   │   └── DiagnosticsModal.tsx             # Bottom Sheet (Telemetría, Gráfica 20s, Tabla y Explorador Código)
 │   ├── hooks/
-│   │   ├── useGyroARStabilization.ts    # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
-│   │   └── useResponsiveLayout.ts       # Alturas dinámicas useWindowDimensions + SafeArea
+│   │   ├── useWebVisionEngine.ts            # Motor Real WebGPU -> WebGL -> WASM + 80 Clases COCO + 17kp Pose
+│   │   ├── useGyroARStabilization.ts        # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
+│   │   └── useResponsiveLayout.ts           # Alturas dinámicas useWindowDimensions + SafeArea
+│   ├── config/
+│   │   └── ARThemeConfig.ts                 # 3 estilos visuales AR (Táctico Cian, Nativo Frosted, Industrial)
 │   ├── utils/
-│   │   ├── visionPostProcessor.ts       # Zero-alloc YOLO decode + Class-NMS + ByteTrack + Letterbox
-│   │   ├── PipelineProfiler.ts          # Instrumentación 6 etapas (EMA + FPS real/teórico)
-│   │   └── AdaptiveThermalController.ts # Gobernador térmico (Ultra / Balanced / Thermal Safe)
-│   └── screens/
-│       └── VisionEdgeDashboard.tsx      # Dashboard Dark Mode 100% viewport sin scroll
-├── app.json                             # Expo CNG plugins (VisionCamera, FastTFLite, Native Patch)
-├── babel.config.js                      # Orden exacto Worklets Core + Reanimated plugins
-├── metro.config.js                      # assetExts: ['tflite', 'mlpackage', 'bin']
-└── package.json`;
+│   │   ├── visionPostProcessor.ts           # Zero-alloc YOLO decode (80 COCO) + Class-NMS + ByteTrack
+│   │   └── pipelineThermal.ts               # Instrumentación 6 etapas (EMA) + Gobernador Térmico
+│   ├── models/
+│   │   └── useVisionModels.ts               # Hook TFLite CoreML / GPU / NNAPI (React Native)
+│   └── processors/
+│       └── useObjectDetectionProcessor.ts   # Frame Processor JSI + resize + runSync (React Native)
+├── plugins/
+│   └── withVisionEdgeNative.js              # Config Plugin CNG: aaptOptions noCompress .tflite, GPU, iOS 15.1+
+├── app.json                                 # Expo CNG plugins (VisionCamera, FastTFLite, expo-sensors)
+└── package.json                             # Dependencias WebGPU/TF.js/ONNX Runtime Web + React Native`;
 
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
+  {
+    id: 'ar-start-overlay',
+    path: 'src/components/ARStartOverlay.tsx',
+    name: 'ARStartOverlay.tsx',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Pantalla inicial inmersiva con el botón flotante de alto contraste "Iniciar Cámara AR": ejecuta en secuencia en el gesto onClick (1) DeviceMotionEvent.requestPermission() en iOS 13+, (2) getUserMedia + video.play(), y (3) desbloqueo de WebAudio/vibración + diagnóstico de HTTPS y permisos.',
+    highlights: [
+      'Secuencia estricta en gesto onClick para cumplir políticas de iOS Safari 13+ y Chrome Android',
+      'Captura segura de DeviceMotionEvent.requestPermission() y DeviceOrientationEvent.requestPermission()',
+      'Diagnóstico en pantalla si el usuario accede por HTTP en vez de HTTPS o deniega permisos de cámara',
+    ],
+    content: arStartOverlayRaw,
+  },
+  {
+    id: 'use-web-vision-engine',
+    path: 'src/hooks/useWebVisionEngine.ts',
+    name: 'useWebVisionEngine.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Motor de inferencia real en navegador móvil con fallback automático WebGPU -> WebGL -> WASM SIMD, captura por requestVideoFrameCallback (con fallback a requestAnimationFrame), letterbox 640x640 normalizado a Float32Array [0.0, 1.0], reconocimiento de las 80 clases de COCO y esqueleto de 17 puntos.',
+    highlights: [
+      'Detección automática de capacidades: WebGPU -> WebGL FP16 -> WASM SIMD (TensorFlow.js + ONNX Runtime Web)',
+      'requestVideoFrameCallback con fallback a requestAnimationFrame + canvas oculto 640x640 letterbox',
+      'Decodificación completa de las 80 clases de COCO (Personas, Vehículos, Animales y Objetos) + 17 keypoints',
+    ],
+    content: useWebVisionEngineRaw,
+  },
+  {
+    id: 'web-camera-stream',
+    path: 'src/components/WebCameraStream.tsx',
+    name: 'WebCameraStream.tsx',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Componente universal de cámara WebRTC para iOS Safari, Chrome Android, Firefox, Edge y Samsung Internet: aplica restricciones progresivas anti-OverconstrainedError, atributos playsInline/webkit-playsinline/muted/autoPlay, object-fit: cover (100vw x 100dvh) y liberación segura de tracks al cambiar de cámara.',
+    highlights: [
+      'Fallback progresivo en 3 niveles para getUserMedia (1280x720 ideal -> 640x480 -> universal)',
+      'Atributos nativos playsinline y webkit-playsinline="true" para evitar reproductor fullscreen en iOS/Samsung',
+      'Detención explícita stream.getTracks().forEach(t => t.stop()) antes de alternar entre trasera y frontal',
+    ],
+    content: webCameraStreamRaw,
+  },
+  {
+    id: 'ar-web-canvas-overlay',
+    path: 'src/components/ARWebCanvasOverlay.tsx',
+    name: 'ARWebCanvasOverlay.tsx',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Lienzo AR HTML5 superpuesto a pantalla completa escalado con window.devicePixelRatio: proyecta coordenadas letterbox 640x640 hacia object-fit: cover, dibuja corner brackets tácticos, callout pins con distancia estimada (~Xm), esqueleto verde neón (#22C55E), suavizado LERP y estabilización devicemotion/deviceorientation.',
+    highlights: [
+      'Escalado Retina/HiDPI con window.devicePixelRatio y proyección exacta letterbox -> object-fit: cover',
+      'Fusión en vivo con sensores web devicemotion (rad/s) y deviceorientation + interpolación LERP a 60 FPS',
+      'Soporte completo para los 3 estilos AR (Táctico Cian, Minimalista Nativo y Alto Contraste Industrial)',
+    ],
+    content: arWebCanvasOverlayRaw,
+  },
   {
     id: 'app-tsx-unified',
     path: 'App.tsx (Full-Screen AR HUD + 60Hz Gyro Entry)',

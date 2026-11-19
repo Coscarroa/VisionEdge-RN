@@ -562,72 +562,72 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                 )}
               </section>
 
-              {/* Sección 6: Acceso Directo a los Archivos de Arquitectura AR & Giroscopio */}
+              {/* Sección 6: Acceso Directo a los Archivos de Arquitectura Web AR (WebGPU/WASM) & React Native */}
               <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between gap-2">
                   <div>
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                      6. Arquitectura React Native AR + Giroscopio + Skia
+                      6. Arquitectura Web AR (WebGPU / WASM) & React Native
                     </h3>
                     <p className="text-[11px] text-slate-400 mt-0.5">
-                      Inspecciona el código completo listo para producción
+                      Inspecciona el código completo listo para producción en Android e iOS
                     </p>
                   </div>
                   <span className="font-mono text-[10.5px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-400/35 text-emerald-300 shrink-0">
-                    AR HUD + 60Hz IMU
+                    WebGPU + 80 COCO
                   </span>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <button
                     type="button"
-                    onClick={() => handleOpenCodeFile('gyro-ar-stabilization')}
-                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
-                  >
-                    <div className="text-[11px] font-mono font-semibold text-emerald-400 truncate">
-                      useGyroARStabilization.ts
-                    </div>
-                    <div className="text-[10px] text-slate-400 truncate">
-                      expo-sensors 60Hz + SharedValue
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleOpenCodeFile('ar-overlay-canvas')}
+                    onClick={() => handleOpenCodeFile('ar-start-overlay')}
                     className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
                   >
                     <div className="text-[11px] font-mono font-semibold text-sky-400 truncate">
-                      AROverlayCanvas.tsx
+                      ARStartOverlay.tsx
                     </div>
                     <div className="text-[10px] text-slate-400 truncate">
-                      3 Temas AR + LERP + Gyro Offset
+                      Botón &quot;Iniciar Cámara AR&quot; + Permisos iOS 13+ IMU/WebRTC
                     </div>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => handleOpenCodeFile('ar-theme-config')}
+                    onClick={() => handleOpenCodeFile('use-web-vision-engine')}
                     className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
                   >
-                    <div className="text-[11px] font-mono font-semibold text-yellow-400 truncate">
-                      ARThemeConfig.ts
+                    <div className="text-[11px] font-mono font-semibold text-emerald-400 truncate">
+                      useWebVisionEngine.ts
                     </div>
                     <div className="text-[10px] text-slate-400 truncate">
-                      Táctico / Nativo / Industrial
+                      Fallback WebGPU → WebGL → WASM + 80 Clases COCO
                     </div>
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => handleOpenCodeFile('app-tsx-unified')}
+                    onClick={() => handleOpenCodeFile('web-camera-stream')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-amber-400 truncate">
+                      WebCameraStream.tsx
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      getUserMedia Progresivo + playsInline Safari/Samsung
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('ar-web-canvas-overlay')}
                     className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
                   >
                     <div className="text-[11px] font-mono font-semibold text-purple-400 truncate">
-                      App.tsx
+                      ARWebCanvasOverlay.tsx
                     </div>
                     <div className="text-[10px] text-slate-400 truncate">
-                      Full-Screen AR + Glass HUD
+                      Canvas DPR + Letterbox→Cover + LERP + Gyro
                     </div>
                   </button>
                 </div>
