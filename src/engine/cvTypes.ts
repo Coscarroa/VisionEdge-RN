@@ -67,6 +67,8 @@ export interface DetectionResult {
   keypoints: Keypoint[];
 }
 
+export type VehicleMotionStatus = 'EN MOVIMIENTO' | 'DETENIDO';
+
 export interface TrackedObject extends DetectionResult {
   trackId: number;
   age: number;
@@ -75,6 +77,12 @@ export interface TrackedObject extends DetectionResult {
   vy: number;
   centerX: number;
   centerY: number;
+  rawClassName?: string;
+  speedKmh?: number;
+  motionStatus?: VehicleMotionStatus;
+  isOverspeed?: boolean;
+  hasCrossedLine?: boolean;
+  crossingDirection?: 'ENTRADA' | 'SALIDA' | null;
 }
 
 export interface CategoryStats {
@@ -138,6 +146,16 @@ export interface PipelineSettings {
   enableGyro: boolean;
   crowdBoost: boolean;
   isRunning: boolean;
+  /** Modo Exclusivo de Vehículos (filtra 8 clases COCO vehiculares y pausa Pose) */
+  onlyVehiclesMode?: boolean;
+  /** Límite de velocidad en km/h (20..140, por defecto 60 km/h) */
+  speedLimitKmh?: number;
+  /** Activa el pitido táctico doble Web Audio API al detectar exceso de velocidad */
+  enableSpeedSoundAlert?: boolean;
+  /** Factor de calibración de escala monocular (0.5x .. 2.0x, por defecto 1.0x) */
+  distanceCalibrationFactor?: number;
+  /** Muestra u oculta la Línea Virtual de Conteo y Aforo (Tripwire AR) */
+  showCountingLine?: boolean;
 }
 
 export const COCO_KEYPOINT_NAMES = [

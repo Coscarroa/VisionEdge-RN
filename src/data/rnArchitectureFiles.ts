@@ -7,6 +7,9 @@ import useOnnxVisionEngineRaw from '../hooks/useOnnxVisionEngine.ts?raw';
 import useInertialARTrackerRaw from '../hooks/useInertialARTracker.ts?raw';
 import useWebVisionEngineRaw from '../hooks/useWebVisionEngine.ts?raw';
 import arWebCanvasOverlayRaw from '../components/ARWebCanvasOverlay.tsx?raw';
+import vehicleSpeedEstimatorRaw from '../utils/VehicleSpeedEstimator.ts?raw';
+import speedAlertSystemRaw from '../utils/SpeedAlertSystem.ts?raw';
+import virtualCountingLineRaw from '../utils/VirtualCountingLine.ts?raw';
 import exportOnnxWebColabRaw from '../../scripts/export_onnx_web_colab.py?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
@@ -24,16 +27,16 @@ export interface CodeFileNode {
 
 export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 ├── src/
-│   ├── App.tsx                              # Visor AR ONNX 100% Edge-to-Edge + HUD Glassmorphism + Kalman IMU
+│   ├── App.tsx                              # Visor AR ONNX + VehicleModeToggle + Radar de Tráfico y Aforo AR
 │   ├── components/
 │   │   ├── ARStartOverlay.tsx               # Botón flotante "Iniciar Cámara AR" + Permisos iOS 13+ IMU/WebRTC
 │   │   ├── WebCameraStream.tsx              # getUserMedia progresivo + playsInline Safari/Samsung + Switch Cam
-│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HiDPI + Retículas Neón + Estelas 15pt + Callout Pins + Kalman
+│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HiDPI + Retículas Neón + Línea Virtual Aforo + Alerta Exceso
 │   │   ├── AROverlayCanvas.tsx              # Skia AR Full-Screen (React Native) + LERP + 60Hz Gyro Offset
 │   │   ├── DetectionOverlayCanvas.tsx       # Skia PictureRecorder 60 FPS (cero re-renders)
-│   │   └── DiagnosticsModal.tsx             # Bottom Sheet (Telemetría, Gráfica 20s, Tabla y Explorador Código)
+│   │   └── DiagnosticsModal.tsx             # Bottom Sheet (Radar Vehicular, Aforo, Telemetría y Explorador Código)
 │   ├── hooks/
-│   │   ├── useOnnxVisionEngine.ts           # ONNX Runtime Web (WebGPU/WASM SIMD) + Letterbox #727272 + Planar NCHW
+│   │   ├── useOnnxVisionEngine.ts           # ONNX Runtime Web + Modo Solo Vehículos (Clases 1-8) + Pausa Pose
 │   │   ├── useInertialARTracker.ts          # Filtro de Kalman 1D + LERP + devicemotion/deviceorientation 60/120Hz
 │   │   ├── useWebVisionEngine.ts            # Motor WebGPU -> WebGL -> WASM + 80 Clases COCO + 17kp Pose
 │   │   ├── useGyroARStabilization.ts        # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
@@ -41,6 +44,9 @@ export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 │   ├── config/
 │   │   └── ARThemeConfig.ts                 # 3 estilos visuales AR (Táctico Cian, Nativo Frosted, Industrial)
 │   ├── utils/
+│   │   ├── VehicleSpeedEstimator.ts         # Motor Cinemático Monocular (km/h) + Compensación IMU + Histéresis
+│   │   ├── SpeedAlertSystem.ts              # Alerta Visual Roja Pulsante + Web Audio API OscillatorNode (3s Cooldown)
+│   │   ├── VirtualCountingLine.ts           # Línea Virtual de Aforo AR + Intersección Vectorial 2D + Set<trackId>
 │   │   ├── visionPostProcessor.ts           # Zero-alloc YOLO decode (80 COCO) + Class-NMS + ByteTrack
 │   │   └── pipelineThermal.ts               # Instrumentación 6 etapas (EMA) + Gobernador Térmico
 │   ├── models/
@@ -56,6 +62,48 @@ export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 └── vite.config.ts                           # Configuración MIME/CORS para servir .onnx y .wasm sin errores`;
 
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
+  {
+    id: 'vehicle-speed-estimator',
+    path: 'src/utils/VehicleSpeedEstimator.ts',
+    name: 'VehicleSpeedEstimator.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Motor cinemático monocular de velocidad vehicular (km/h) y detección de vehículos detenidos: almacena historial de 15 muestras por trackId, descuenta el desplazamiento angular del giroscopio (useInertialARTracker), calcula escala dinámica píxeles-por-metro por categoría física con EMA de 500ms y aplica histéresis de 600ms para clasificar DETENIDO (<3.5 km/h) vs EN MOVIMIENTO (>4.5 km/h).',
+    highlights: [
+      'Compensación de movimiento de mano restando (gyroOffsetX, gyroOffsetY) del vector del centroide',
+      'Escala dinámica monocular por dimensión estándar (car=1.85m, bus=2.55m, truck=2.50m, moto/bici=0.80m) + EMA 500ms',
+      'Histéresis anti-ruido de 600ms: < 3.5 km/h -> DETENIDO | > 4.5 km/h -> EN MOVIMIENTO',
+    ],
+    content: vehicleSpeedEstimatorRaw,
+  },
+  {
+    id: 'speed-alert-system',
+    path: 'src/utils/SpeedAlertSystem.ts',
+    name: 'SpeedAlertSystem.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Sistema de alerta visual y sonora de exceso de velocidad: evalúa speedKmh > speedLimitKmh, activa estado visual rojo carmesí pulsante (#EF4444) con banner superior y sintetiza un doble pitido táctico (1380Hz / 1760Hz) mediante Web Audio API (OscillatorNode + GainNode) con cooldown de 3 segundos por trackId.',
+    highlights: [
+      'Síntesis nativa Web Audio API (OscillatorNode + GainNode) sin depender de archivos .mp3 externos',
+      'Desbloqueo automático de AudioContext en el gesto onClick de "Iniciar Cámara AR" para iOS Safari y Chrome Android',
+      'Cooldown individual de 3000ms por trackId para evitar saturación acústica en tráfico denso',
+    ],
+    content: speedAlertSystemRaw,
+  },
+  {
+    id: 'virtual-counting-line',
+    path: 'src/utils/VirtualCountingLine.ts',
+    name: 'VirtualCountingLine.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Línea virtual interactiva de conteo y aforo vehicular (Tripwire AR): evalúa intersección geométrica de segmentos 2D mediante productos cruzados entre la trayectoria del vehículo (prevCenter -> currentCenter) y la línea virtual (lineA -> lineB), garantizando conteo único con Set<number> y desglose por dirección (↑ Entrada / ↓ Salida) y categoría.',
+    highlights: [
+      'Prueba exacta de intersección de segmentos 2D por orientación de productos cruzados (crossProduct2D)',
+      'Garantía de conteo único por vehículo mediante Set<number> (countedTrackIds) y discriminación ↑ Entrada / ↓ Salida',
+      'Nodos extremos A y B arrastrables en pantalla + destello neón de cruce y desglose Autos / Motos-Bicis / Buses-Camiones',
+    ],
+    content: virtualCountingLineRaw,
+  },
   {
     id: 'export-onnx-web-colab',
     path: 'scripts/export_onnx_web_colab.py',
@@ -76,11 +124,11 @@ export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
     name: 'useOnnxVisionEngine.ts',
     language: 'typescript',
     deliverable: 'inference',
-    summary: 'Motor de inferencia ONNX Runtime Web de alto rendimiento: configura ort.env.wasm.wasmPaths y ort.env.wasm.simd = true con executionProviders ["webgpu", "wasm"], preprocesa en Letterbox gris neutro (#727272, 114/255) y Tensor Planar NCHW [1, 3, 640, 640] en Float32Array [0, 1], decodifica [1, 84, 8400] y [1, 56, 8400] con stride channel * 8400 + proposalIndex, Class-Aware NMS (IoU=0.45) y ByteTrack con estela de 15 posiciones.',
+    summary: 'Motor de inferencia ONNX Runtime Web con Modo Exclusivo de Vehículos (onlyVehiclesMode): filtra el decodificador de tensores para las 8 clases vehiculares de COCO (1..8), pausa automáticamente yolo11n-pose.onnx para dedicar el 100% de GPU/WASM a seguimiento vehicular e integra VehicleSpeedEstimator, SpeedAlertSystem y VirtualCountingLine.',
     highlights: [
+      'Modo Solo Vehículos (onlyVehiclesMode): filtra clases 1..8 en decodeYolo11OnnxOutput y pausa yolo11n-pose.onnx',
       'Preprocesamiento exacto Letterbox (#727272, 114/255) + Tensor Planar NCHW [1, 3, 640, 640] Float32Array',
-      'Decodificación transpuesta [1, 84, 8400] (stride channel * 8400 + proposalIndex) sin doble sigmoid',
-      'Bucle Zero-Freeze con requestVideoFrameCallback + bandera isInferencingRef + ByteTrack 15-pt Motion Trails',
+      'Integración en tiempo real con VehicleSpeedEstimator (km/h), SpeedAlertSystem y VirtualCountingLine (Aforo AR)',
     ],
     content: useOnnxVisionEngineRaw,
   },

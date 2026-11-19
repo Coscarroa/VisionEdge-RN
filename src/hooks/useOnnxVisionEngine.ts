@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import * as ort from 'onnxruntime-web';
 import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
@@ -9,7 +9,22 @@ import {
   SemanticCategory,
   getSemanticCategory,
 } from '../utils/visionPostProcessor';
-import { COCO_KEYPOINT_NAMES } from '../engine/cvTypes';
+import { COCO_KEYPOINT_NAMES, VehicleMotionStatus } from '../engine/cvTypes';
+import {
+  COCO_VEHICLE_CLASS_IDS,
+  isCocoVehicleClass,
+  VehicleSpeedEstimator,
+} from '../utils/VehicleSpeedEstimator';
+import {
+  globalSpeedAlertSystem,
+  OverspeedBannerAlert,
+} from '../utils/SpeedAlertSystem';
+import {
+  CrossingDirection,
+  globalVirtualCountingLine,
+  TrafficCountBreakdown,
+} from '../utils/VirtualCountingLine';
+import { InertialARState } from './useInertialARTracker';
 
 export type OnnxExecutionProvider = 'webgpu' | 'wasm' | 'webgl';
 
@@ -59,6 +74,16 @@ export interface OnnxTrackedDetection {
   speedPxPerSec: number;
   /** Velocidad relativa estimada en m/s */
   speedMetersPerSec: number;
+  /** Velocidad cinemática compensada en km/h (VehicleSpeedEstimator) */
+  speedKmh: number;
+  /** Clasificación con histéresis: 'DETENIDO' (<3.5 km/h por >600ms) vs 'EN MOVIMIENTO' (>4.5 km/h) */
+  motionStatus: VehicleMotionStatus;
+  /** Indica si el vehículo supera el umbral configurable speedLimitKmh */
+  isOverspeed: boolean;
+  /** Indica si el vehículo ya cruzó la Línea Virtual de Aforo */
+  hasCrossedLine: boolean;
+  /** Dirección del cruce en la Línea Virtual ('ENTRADA' | 'SALIDA' | null) */
+  crossingDirection: CrossingDirection | null;
   age: number;
   lostFrames: number;
   keypoints: OnnxKeypoint2D[];
@@ -72,6 +97,17 @@ export interface OnnxCategoryCounts {
   animals: number;
   objects: number;
   total: number;
+}
+
+export interface OnnxTrafficLiveTelemetry {
+  movingVehicles: number;
+  stoppedVehicles: number;
+  averageSpeedKmh: number;
+  maxSpeedKmh: number;
+  overspeedTotalCount: number;
+  activeOverspeedInView: number;
+  activeBanner: OverspeedBannerAlert | null;
+  countingStats: TrafficCountBreakdown;
 }
 
 export interface OnnxVisionTimings {
@@ -104,6 +140,18 @@ export interface UseOnnxVisionEngineOptions {
   nmsIouThreshold: number;
   enablePose: boolean;
   isPaused: boolean;
+  /** Modo Exclusivo de Vehículos: filtra las 8 clases de vehículos de COCO y pausa yolo11n-pose.onnx */
+  onlyVehiclesMode: boolean;
+  /** Límite de velocidad en km/h (20..140, por defecto 60 km/h) */
+  speedLimitKmh: number;
+  /** Habilita el doble pitido táctico Web Audio API al superar speedLimitKmh */
+  enableSpeedSoundAlert: boolean;
+  /** Factor de calibración de escala monocular (0.5x .. 2.0x) */
+  distanceCalibrationFactor: number;
+  /** Habilita el conteo geométrico en la Línea Virtual de Aforo */
+  showCountingLine: boolean;
+  /** Referencia de estado inercial (useInertialARTracker) para restar movimiento de mano */
+  inertialStateRef?: React.MutableRefObject<InertialARState>;
   /** Ruta al modelo YOLO11n/YOLOv8n (.onnx). Por defecto: '/models/yolo11n.onnx' */
   onnxDetectorUrl?: string;
   /** Ruta al modelo YOLO11n-pose (.onnx). Por defecto: '/models/yolo11n-pose.onnx' */
@@ -120,10 +168,12 @@ export interface UseOnnxVisionEngineResult {
   isNativeOnnxSession: boolean;
   detections: OnnxTrackedDetection[];
   counts: OnnxCategoryCounts;
+  trafficTelemetry: OnnxTrafficLiveTelemetry;
   timings: OnnxVisionTimings;
   letterboxMeta: OnnxLetterboxMeta;
   inputSample5: number[];
   loadCustomOnnxFile: (file: File, modelRole?: 'detector' | 'pose') => Promise<void>;
+  resetTrafficCounts: () => void;
 }
 
 const MODEL_INPUT_SIZE = 640;
@@ -132,7 +182,7 @@ const YOLO_NUM_PROPOSALS = 8400;
 const YOLO_NUM_CLASSES = 80;
 const MAX_TRAIL_LENGTH = 15;
 
-// 1. Configuración explícita de ONNX Runtime Web apuntando a los binarios locales /ort-wasm/ (servidos desde node_modules/onnxruntime-web/dist)
+// 1. Configuración explícita de ONNX Runtime Web apuntando a los binarios locales /ort-wasm/
 const ORT_LOCAL_WASM_PATHS = '/ort-wasm/';
 ort.env.wasm.wasmPaths = ORT_LOCAL_WASM_PATHS;
 ort.env.wasm.simd = true;
@@ -212,12 +262,15 @@ interface RawDecodedCandidate {
   keypoints?: OnnxKeypoint2D[];
 }
 
+// Clases exclusivas de vehículos en COCO: bicycle(1), car(2), motorcycle(3), airplane(4), bus(5), train(6), truck(7), boat(8)
+const VEHICLE_CLASS_LIST = [1, 2, 3, 4, 5, 6, 7, 8] as const;
+
 /**
  * Decodificador Exacto del Tensor Transpuesto de YOLO11n / YOLOv8n ONNX:
  * - Forma estándar Ultralytics ONNX: [1, 84, 8400] (84 canales x 8400 propuestas)
- * - Stride exacto: channel * 8400 + proposalIndex (o transpuesto [1, 8400, 84] si se exportó con transpose)
- * - SIN doble sigmoid sobre los puntajes (el grafo ONNX ya incluye Sigmoid en la cabeza Detect).
- * - Auto-detección de escala de coordenadas: [0..1] normalizado vs [0..640] píxeles (w <= 1.5).
+ * - Stride exacto: channel * 8400 + proposalIndex
+ * - Cuando onlyVehiclesMode === true: evalúa únicamente los canales de las 8 clases de vehículos de COCO
+ *   (bicycle=1, car=2, motorcycle=3, airplane=4, bus=5, train=6, truck=7, boat=8), reduciendo el bucle interno en 10x.
  */
 export function decodeYoloOnnxOutputTensor(
   outputData: Float32Array,
@@ -226,46 +279,71 @@ export function decodeYoloOnnxOutputTensor(
   letterbox: OnnxLetterboxMeta,
   screenWidth: number,
   screenHeight: number,
-  mirrorHorizontal: boolean
+  mirrorHorizontal: boolean,
+  onlyVehiclesMode = false
 ): RawDecodedCandidate[] {
   const candidates: RawDecodedCandidate[] = [];
   const d1 = dims[1] ?? 84;
   const d2 = dims[2] ?? YOLO_NUM_PROPOSALS;
 
-  // Determinar si el layout es [1, 84, 8400] (channels-first, estándar Ultralytics) o [1, 8400, 84]
   const isChannelsFirst = d1 < d2;
   const numChannels = isChannelsFirst ? d1 : d2;
   const numProposals = isChannelsFirst ? d2 : d1;
   const numClasses = Math.min(YOLO_NUM_CLASSES, Math.max(1, numChannels - 4));
 
   for (let p = 0; p < numProposals; p++) {
-    // Encontrar la clase con mayor confianza dentro de las 80 clases de COCO
     let bestClassId = 0;
     let maxScore = 0;
 
-    if (isChannelsFirst) {
-      // Stride exacto: channel * numProposals + proposalIndex
-      for (let c = 0; c < numClasses; c++) {
-        const score = outputData[(4 + c) * numProposals + p];
-        if (score > maxScore) {
-          maxScore = score;
-          bestClassId = c;
+    if (onlyVehiclesMode) {
+      // Optimización Modo Solo Vehículos: escanea exclusivamente los 8 canales vehiculares (1..8)
+      if (isChannelsFirst) {
+        for (let idx = 0; idx < VEHICLE_CLASS_LIST.length; idx++) {
+          const c = VEHICLE_CLASS_LIST[idx];
+          if (c >= numClasses) continue;
+          const score = outputData[(4 + c) * numProposals + p];
+          if (score > maxScore) {
+            maxScore = score;
+            bestClassId = c;
+          }
+        }
+      } else {
+        const baseOffset = p * numChannels;
+        for (let idx = 0; idx < VEHICLE_CLASS_LIST.length; idx++) {
+          const c = VEHICLE_CLASS_LIST[idx];
+          if (c >= numClasses) continue;
+          const score = outputData[baseOffset + 4 + c];
+          if (score > maxScore) {
+            maxScore = score;
+            bestClassId = c;
+          }
         }
       }
     } else {
-      const baseOffset = p * numChannels;
-      for (let c = 0; c < numClasses; c++) {
-        const score = outputData[baseOffset + 4 + c];
-        if (score > maxScore) {
-          maxScore = score;
-          bestClassId = c;
+      // Modo Universal: escanea las 80 clases completas de COCO
+      if (isChannelsFirst) {
+        for (let c = 0; c < numClasses; c++) {
+          const score = outputData[(4 + c) * numProposals + p];
+          if (score > maxScore) {
+            maxScore = score;
+            bestClassId = c;
+          }
+        }
+      } else {
+        const baseOffset = p * numChannels;
+        for (let c = 0; c < numClasses; c++) {
+          const score = outputData[baseOffset + 4 + c];
+          if (score > maxScore) {
+            maxScore = score;
+            bestClassId = c;
+          }
         }
       }
     }
 
     if (maxScore < confidenceThreshold) continue;
+    if (onlyVehiclesMode && !COCO_VEHICLE_CLASS_IDS.has(bestClassId)) continue;
 
-    // Extraer coordenadas [cx, cy, w, h]
     let cx: number;
     let cy: number;
     let w: number;
@@ -284,7 +362,6 @@ export function decodeYoloOnnxOutputTensor(
       h = outputData[baseOffset + 3];
     }
 
-    // Auto-detectar si el modelo exportó coordenadas normalizadas [0..1] o en píxeles [0..640]
     if (w <= 1.5 && h <= 1.5 && cx <= 1.5 && cy <= 1.5) {
       cx *= MODEL_INPUT_SIZE;
       cy *= MODEL_INPUT_SIZE;
@@ -341,8 +418,7 @@ export function decodeYoloOnnxOutputTensor(
 }
 
 /**
- * Decodificador Exacto del Tensor de Pose YOLO11n-pose / YOLOv8n-pose ONNX:
- * - Forma estándar Ultralytics Pose: [1, 56, 8400] (4 bbox + 1 score + 17 * 3 keypoints)
+ * Decodificador Exacto del Tensor de Pose YOLO11n-pose / YOLOv8n-pose ONNX ([1, 56, 8400])
  */
 export function decodeYoloPoseOnnxTensor(
   poseData: Float32Array,
@@ -431,10 +507,6 @@ export function decodeYoloPoseOnnxTensor(
   return results;
 }
 
-/**
- * Estima los 17 keypoints articulares biomecánicos de COCO cuando sólo está cargado el modelo detector
- * de 80 clases sin el archivo adicional yolo11n-pose.onnx.
- */
 function estimatePerson17KeypointsFromROI(
   screenBox: { x: number; y: number; width: number; height: number },
   vx: number,
@@ -485,6 +557,12 @@ export function useOnnxVisionEngine({
   nmsIouThreshold,
   enablePose,
   isPaused,
+  onlyVehiclesMode,
+  speedLimitKmh,
+  enableSpeedSoundAlert,
+  distanceCalibrationFactor,
+  showCountingLine,
+  inertialStateRef,
   onnxDetectorUrl = '/models/yolo11n.onnx',
   onnxPoseUrl = '/models/yolo11n-pose.onnx',
   onNewInferenceFrame,
@@ -506,6 +584,16 @@ export function useOnnxVisionEngine({
     objects: 0,
     total: 0,
   });
+  const [trafficTelemetry, setTrafficTelemetry] = useState<OnnxTrafficLiveTelemetry>(() => ({
+    movingVehicles: 0,
+    stoppedVehicles: 0,
+    averageSpeedKmh: 0,
+    maxSpeedKmh: 0,
+    overspeedTotalCount: 0,
+    activeOverspeedInView: 0,
+    activeBanner: null,
+    countingStats: globalVirtualCountingLine.getStats(),
+  }));
   const [timings, setTimings] = useState<OnnxVisionTimings>({
     captureMs: 0.9,
     preprocessMs: 2.2,
@@ -528,12 +616,10 @@ export function useOnnxVisionEngine({
     0.4471, 0.4471, 0.4471, 0.4471, 0.4471,
   ]);
 
-  // Sesiones de ONNX Runtime Web (.onnx) y fallback neuronal COCO-80
   const ortDetectorSessionRef = useRef<ort.InferenceSession | null>(null);
   const ortPoseSessionRef = useRef<ort.InferenceSession | null>(null);
   const cocoFallbackModelRef = useRef<cocoSsd.ObjectDetection | null>(null);
 
-  // Canvas oculto 640x640 para preprocesamiento Letterbox (#727272 = 114/255)
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const offscreenCtxRef = useRef<CanvasRenderingContext2D | null>(null);
 
@@ -542,13 +628,13 @@ export function useOnnxVisionEngine({
     new Float32Array(3 * MODEL_INPUT_SIZE * MODEL_INPUT_SIZE)
   );
 
-  // Estado persistente de ByteTrack + Motion Trails (últimas 15 posiciones por trackId)
+  // Motor Cinemático de Velocidad y Estado (VehicleSpeedEstimator.ts)
+  const speedEstimatorRef = useRef<VehicleSpeedEstimator>(new VehicleSpeedEstimator());
+
   const tracksRef = useRef<OnnxTrackedDetection[]>([]);
   const nextTrackIdRef = useRef<number>(1);
-  // Bandera Zero-Freeze para impedir que se apilen inferencias simultáneas en memoria
   const isInferencingRef = useRef<boolean>(false);
   const lastUiPushRef = useRef<number>(0);
-  const lastInferenceTimeRef = useRef<number>(performance.now());
   const emaTimingsRef = useRef<OnnxVisionTimings>({
     captureMs: 0.9,
     preprocessMs: 2.2,
@@ -566,6 +652,12 @@ export function useOnnxVisionEngine({
     nmsIouThreshold,
     enablePose,
     isPaused,
+    onlyVehiclesMode,
+    speedLimitKmh,
+    enableSpeedSoundAlert,
+    distanceCalibrationFactor,
+    showCountingLine,
+    inertialStateRef,
     onNewInferenceFrame,
   });
   optionsRef.current = {
@@ -576,13 +668,28 @@ export function useOnnxVisionEngine({
     nmsIouThreshold,
     enablePose,
     isPaused,
+    onlyVehiclesMode,
+    speedLimitKmh,
+    enableSpeedSoundAlert,
+    distanceCalibrationFactor,
+    showCountingLine,
+    inertialStateRef,
     onNewInferenceFrame,
   };
 
-  /**
-   * Permite cargar en vivo cualquier archivo .onnx local (yolo11n.onnx o yolov8n.onnx)
-   * directamente desde el navegador móvil o escritorio sin reiniciar la aplicación.
-   */
+  const resetTrafficCounts = useCallback(() => {
+    const cleanStats = globalVirtualCountingLine.resetCounts();
+    globalSpeedAlertSystem.resetCounts();
+    speedEstimatorRef.current.reset();
+    setTrafficTelemetry((prev) => ({
+      ...prev,
+      overspeedTotalCount: 0,
+      activeOverspeedInView: 0,
+      activeBanner: null,
+      countingStats: cleanStats,
+    }));
+  }, []);
+
   const loadCustomOnnxFile = useCallback(
     async (file: File, modelRole: 'detector' | 'pose' = 'detector') => {
       setIsEngineLoading(true);
@@ -636,7 +743,6 @@ export function useOnnxVisionEngine({
         });
       }
 
-      // Verificar disponibilidad real del adaptador WebGPU
       let webgpuAvailable = false;
       if (
         typeof navigator !== 'undefined' &&
@@ -672,7 +778,7 @@ export function useOnnxVisionEngine({
             });
             return { session, provider: 'webgpu' };
           } catch {
-            // Fallback limpio a WASM SIMD si algún operador WebGPU no está soportado en el dispositivo
+            // Fallback limpio a WASM SIMD
           }
         }
         const session = await ort.InferenceSession.create(modelUrl, {
@@ -682,7 +788,6 @@ export function useOnnxVisionEngine({
         return { session, provider: 'wasm' };
       };
 
-      // Intentar cargar /models/yolo11n.onnx y /models/yolo11n-pose.onnx desde /public/models/
       let loadedNativeOnnx = false;
       let actualProvider: OnnxExecutionProvider = preferredProvider;
       let loadedPoseOnnx = false;
@@ -706,7 +811,6 @@ export function useOnnxVisionEngine({
             setActiveBackend(actualProvider);
           }
 
-          // Cargar también /models/yolo11n-pose.onnx si está disponible en /public/models/
           try {
             const poseCheck = await fetch(onnxPoseUrl, { method: 'HEAD' });
             const poseType = poseCheck.headers.get('content-type') || '';
@@ -743,7 +847,6 @@ export function useOnnxVisionEngine({
         return;
       }
 
-      // Inicializar motor neuronal de respaldo COCO-80 en WebGPU / WebGL / WASM para que funcione out-of-the-box
       setEngineStatusText(
         `Activando motor neuronal COCO-80 (${preferredProvider.toUpperCase()} / WASM SIMD)...`
       );
@@ -797,10 +900,6 @@ export function useOnnxVisionEngine({
 
   /**
    * 2. Preprocesamiento Exacto Letterbox (#727272, 114/255) + Tensor Planar NCHW [1, 3, 640, 640]
-   *    - Todos los canales R primero [0 .. 409599]
-   *    - Todos los canales G después [409600 .. 819199]
-   *    - Todos los canales B al final [819200 .. 1228799]
-   *    - Normalizados en Float32Array [0.0, 1.0]. Nunca NHWC ni BGR.
    */
   const preprocessFrameToPlanarNchw640 = useCallback(
     (video: HTMLVideoElement, populateFullPlanarTensor: boolean): OnnxLetterboxMeta | null => {
@@ -817,7 +916,6 @@ export function useOnnxVisionEngine({
       const padX = Math.floor((MODEL_INPUT_SIZE - drawWidth) * 0.5);
       const padY = Math.floor((MODEL_INPUT_SIZE - drawHeight) * 0.5);
 
-      // Relleno gris neutro oficial Ultralytics YOLO (#727272 = 114/255 = 0.4470588)
       ctx.fillStyle = '#727272';
       ctx.fillRect(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
       ctx.drawImage(video, 0, 0, vw, vh, padX, padY, drawWidth, drawHeight);
@@ -831,12 +929,11 @@ export function useOnnxVisionEngine({
         const bOffset = PLANE_PIXELS * 2;
 
         for (let i = 0, p = 0; p < PLANE_PIXELS; i += 4, p++) {
-          nchw[p] = rgba[i] * inv255; // Canal R planar
-          nchw[gOffset + p] = rgba[i + 1] * inv255; // Canal G planar
-          nchw[bOffset + p] = rgba[i + 2] * inv255; // Canal B planar
+          nchw[p] = rgba[i] * inv255;
+          nchw[gOffset + p] = rgba[i + 1] * inv255;
+          nchw[bOffset + p] = rgba[i + 2] * inv255;
         }
       } else {
-        // Muestreo planar NCHW de validación sobre la región central del frame
         const sampleRgba = ctx.getImageData(
           MODEL_INPUT_SIZE >> 1,
           MODEL_INPUT_SIZE >> 1,
@@ -862,7 +959,7 @@ export function useOnnxVisionEngine({
     []
   );
 
-  // 3. Bucle Asíncrono Zero-Freeze con requestVideoFrameCallback y bandera isInferencingRef
+  // 3. Bucle Asíncrono Zero-Freeze con Optimización Modo Exclusivo de Vehículos + Motor Cinemático + Tripwire AR
   useEffect(() => {
     if (!videoElement || !isCameraActive || !isEngineReady) return;
 
@@ -895,10 +992,15 @@ export function useOnnxVisionEngine({
         nmsIouThreshold: iouMax,
         enablePose: poseOn,
         isPaused: paused,
+        onlyVehiclesMode: vehiclesOnly,
+        speedLimitKmh: limitKmh,
+        enableSpeedSoundAlert: soundAlertOn,
+        distanceCalibrationFactor: distCalib,
+        showCountingLine: countingLineActive,
+        inertialStateRef: imuRef,
         onNewInferenceFrame: onNewFrame,
       } = optionsRef.current;
 
-      // Guardia estricta Zero-Freeze: nunca apilar inferencias simultáneas en memoria
       if (
         paused ||
         isInferencingRef.current ||
@@ -911,8 +1013,6 @@ export function useOnnxVisionEngine({
 
       isInferencingRef.current = true;
       const t0 = performance.now();
-      const dtSec = Math.max(0.012, Math.min(0.25, (t0 - lastInferenceTimeRef.current) * 0.001));
-      lastInferenceTimeRef.current = t0;
 
       try {
         const hasOrtSession = Boolean(ortDetectorSessionRef.current);
@@ -923,7 +1023,6 @@ export function useOnnxVisionEngine({
           let rawCandidates: RawDecodedCandidate[] = [];
 
           if (ortDetectorSessionRef.current) {
-            // A) Ejecución directa con ONNX Runtime Web y Tensor Planar NCHW [1, 3, 640, 640]
             const session = ortDetectorSessionRef.current;
             const inputName = session.inputNames[0] ?? 'images';
             const inputTensor = new ort.Tensor('float32', planarNchwBufferRef.current, [
@@ -946,12 +1045,14 @@ export function useOnnxVisionEngine({
                 lb,
                 sw,
                 sh,
-                mirrorX
+                mirrorX,
+                vehiclesOnly
               );
             }
 
-            // Si también está cargado yolo11n-pose.onnx, decodificamos el tensor [1, 56, 8400]
-            if (poseOn && ortPoseSessionRef.current) {
+            // En Modo Solo Vehículos (vehiclesOnly === true) se PAUSA automáticamente yolo11n-pose.onnx
+            // liberando el 100% de GPU/WASM para maximizar FPS y precisión cinemática.
+            if (!vehiclesOnly && poseOn && ortPoseSessionRef.current) {
               const poseSession = ortPoseSessionRef.current;
               const poseInName = poseSession.inputNames[0] ?? 'images';
               const poseOut = await poseSession.run({ [poseInName]: inputTensor });
@@ -986,7 +1087,6 @@ export function useOnnxVisionEngine({
               }
             }
           } else if (cocoFallbackModelRef.current) {
-            // B) Inferencia real sobre el canvas letterbox 640x640 (80 clases de COCO)
             const predictions = await cocoFallbackModelRef.current.detect(
               offscreenCanvasRef.current,
               28,
@@ -1000,6 +1100,12 @@ export function useOnnxVisionEngine({
               const [lx, ly, lw, lh] = pred.bbox;
               const className = pred.class.toLowerCase();
               const classId = CLASS_NAME_TO_ID[className] ?? 0;
+
+              // Filtro estricto de las 8 clases de vehículos de COCO cuando onlyVehiclesMode === true
+              if (vehiclesOnly && !isCocoVehicleClass(classId, className)) {
+                continue;
+              }
+
               const category = getSemanticCategory(classId);
 
               const topLeft = projectLetterboxToCoverScreen(lx, ly, lb, sw, sh, mirrorX);
@@ -1057,11 +1163,14 @@ export function useOnnxVisionEngine({
             }
           }
 
-          // 5. Seguimiento Multi-Objeto ByteTrack + Historial de 15 Posiciones (Motion Trails)
+          // 5. ByteTrack + VehicleSpeedEstimator (km/h & DETENIDO/EN MOVIMIENTO) + SpeedAlertSystem + VirtualCountingLine
           const prevTracks = tracksRef.current;
           const matchedPrevIndices = new Set<number>();
           const updatedTracks: OnnxTrackedDetection[] = [];
           const nowSec = t2 * 0.001;
+
+          const gyroOffsetX = imuRef?.current.offsetX ?? 0;
+          const gyroOffsetY = imuRef?.current.offsetY ?? 0;
 
           for (let i = 0; i < nmsKept.length; i++) {
             const det = nmsKept[i];
@@ -1069,7 +1178,7 @@ export function useOnnxVisionEngine({
             const cy = det.screenBox.y + det.screenBox.height * 0.5;
 
             let bestTrackIdx = -1;
-            let bestIou = 0.22;
+            let bestIou = 0.20;
 
             for (let t = 0; t < prevTracks.length; t++) {
               if (matchedPrevIndices.has(t)) continue;
@@ -1081,81 +1190,105 @@ export function useOnnxVisionEngine({
               }
             }
 
+            let trackId: number;
+            let vx = 0;
+            let vy = 0;
+            let age = 1;
+            let nextTrail: MotionTrailPoint[];
+
             if (bestTrackIdx >= 0) {
               matchedPrevIndices.add(bestTrackIdx);
               const prev = prevTracks[bestTrackIdx];
+              trackId = prev.trackId;
               const dx = cx - prev.centerX;
               const dy = cy - prev.centerY;
-              const vx = prev.vx * 0.65 + dx * 0.35;
-              const vy = prev.vy * 0.65 + dy * 0.35;
-              const instSpeedPxS = Math.hypot(dx, dy) / dtSec;
-              const speedPxPerSec = prev.speedPxPerSec * 0.7 + instSpeedPxS * 0.3;
+              vx = prev.vx * 0.65 + dx * 0.35;
+              vy = prev.vy * 0.65 + dy * 0.35;
+              age = prev.age + 1;
+              nextTrail = [...prev.trail, { x: cx, y: cy, timestampMs: t2 }].slice(
+                -MAX_TRAIL_LENGTH
+              );
+            } else {
+              trackId = nextTrackIdRef.current++;
+              nextTrail = [{ x: cx, y: cy, timestampMs: t2 }];
+            }
 
-              // Conversión aproximada de velocidad angular en pantalla a m/s usando escala del objeto
-              const metersPerPx =
-                (det.category === 'person' ? 1.72 : det.category === 'vehicle' ? 1.58 : 0.6) /
-                Math.max(24, det.screenBox.height);
-              const speedMetersPerSec = Number((speedPxPerSec * metersPerPx).toFixed(1));
-              const headBias = Math.max(-0.5, Math.min(0.5, vx * 0.05));
+            // A) Calcular velocidad en km/h y estado (DETENIDO vs EN MOVIMIENTO) con compensación inercial
+            const kinematics = speedEstimatorRef.current.updateTrack({
+              trackId,
+              classId: det.classId,
+              className: det.className,
+              centerX: cx,
+              centerY: cy,
+              width: det.screenBox.width,
+              height: det.screenBox.height,
+              timestampMs: t2,
+              gyroOffsetX,
+              gyroOffsetY,
+              distanceCalibrationFactor: distCalib,
+            });
 
-              // Agregar el nuevo centroide al historial de Motion Trails (máximo 15 puntos)
-              const nextTrail = [
-                ...prev.trail,
-                { x: cx, y: cy, timestampMs: t2 },
-              ].slice(-MAX_TRAIL_LENGTH);
-
-              updatedTracks.push({
-                trackId: prev.trackId,
-                classId: det.classId,
+            // B) Evaluar Alerta Visual y Sonora de Exceso de Velocidad (SpeedAlertSystem)
+            const isOverspeed =
+              kinematics.isVehicle &&
+              globalSpeedAlertSystem.evaluateVehicleSpeed({
+                trackId,
                 className: det.className,
-                category: det.category,
-                confidence: det.confidence,
-                screenBox: det.screenBox,
-                letterboxBox: det.letterboxBox,
-                centerX: cx,
-                centerY: cy,
-                vx,
-                vy,
-                speedPxPerSec,
-                speedMetersPerSec,
-                age: prev.age + 1,
-                lostFrames: 0,
-                keypoints:
-                  det.keypoints ??
+                speedKmh: kinematics.speedKmh,
+                speedLimitKmh: limitKmh,
+                soundEnabled: soundAlertOn,
+                nowMs: t2,
+              });
+
+            // C) Evaluar Cruce Bidireccional en la Línea Virtual de Conteo Vehicular (VirtualCountingLine)
+            const crossing = kinematics.isVehicle
+              ? globalVirtualCountingLine.checkVehicleCrossing({
+                  trackId,
+                  className: det.className,
+                  currentCenter: { x: cx, y: cy },
+                  trail: nextTrail,
+                  screenWidth: sw,
+                  screenHeight: sh,
+                  nowMs: t2,
+                  enabled: countingLineActive,
+                })
+              : { hasCrossed: false, direction: null };
+
+            const headBias = Math.max(-0.5, Math.min(0.5, vx * 0.05));
+
+            updatedTracks.push({
+              trackId,
+              classId: det.classId,
+              className: det.className,
+              category: det.category,
+              confidence: det.confidence,
+              screenBox: det.screenBox,
+              letterboxBox: det.letterboxBox,
+              centerX: cx,
+              centerY: cy,
+              vx,
+              vy,
+              speedPxPerSec: kinematics.speedPxPerSec,
+              speedMetersPerSec: kinematics.speedMetersPerSec,
+              speedKmh: kinematics.speedKmh,
+              motionStatus: kinematics.status,
+              isOverspeed,
+              hasCrossedLine: crossing.hasCrossed,
+              crossingDirection: crossing.direction,
+              age,
+              lostFrames: 0,
+              keypoints:
+                !vehiclesOnly &&
+                (det.keypoints ??
                   (poseOn && det.classId === 0
                     ? estimatePerson17KeypointsFromROI(det.screenBox, vx, nowSec, headBias)
-                    : []),
-                trail: nextTrail,
-              });
-            } else {
-              const newId = nextTrackIdRef.current++;
-              updatedTracks.push({
-                trackId: newId,
-                classId: det.classId,
-                className: det.className,
-                category: det.category,
-                confidence: det.confidence,
-                screenBox: det.screenBox,
-                letterboxBox: det.letterboxBox,
-                centerX: cx,
-                centerY: cy,
-                vx: 0,
-                vy: 0,
-                speedPxPerSec: 0,
-                speedMetersPerSec: 0,
-                age: 1,
-                lostFrames: 0,
-                keypoints:
-                  det.keypoints ??
-                  (poseOn && det.classId === 0
-                    ? estimatePerson17KeypointsFromROI(det.screenBox, 0, nowSec, 0)
-                    : []),
-                trail: [{ x: cx, y: cy, timestampMs: t2 }],
-              });
-            }
+                    : [])) ||
+                [],
+              trail: nextTrail,
+            });
           }
 
-          // Mantener tracks ocluidos brevemente (máximo 4 frames) para continuidad de estela ByteTrack
+          // Conservar brevemente tracks ocluidos (máx 4 frames) para continuidad de estela y conteo
           for (let t = 0; t < prevTracks.length; t++) {
             if (matchedPrevIndices.has(t)) continue;
             const lost = prevTracks[t];
@@ -1167,7 +1300,9 @@ export function useOnnxVisionEngine({
             }
           }
 
+          speedEstimatorRef.current.pruneStaleTracks(t2);
           tracksRef.current = updatedTracks;
+
           const visibleDetections = updatedTracks.filter((tr) => tr.lostFrames <= 1);
           setDetections(visibleDetections);
           onNewFrame?.(visibleDetections);
@@ -1201,7 +1336,7 @@ export function useOnnxVisionEngine({
           };
           emaTimingsRef.current = nextEma;
 
-          if (t3 - lastUiPushRef.current >= 200) {
+          if (t3 - lastUiPushRef.current >= 180) {
             lastUiPushRef.current = t3;
 
             let persons = 0;
@@ -1209,12 +1344,36 @@ export function useOnnxVisionEngine({
             let animals = 0;
             let objects = 0;
 
+            let movingVehicles = 0;
+            let stoppedVehicles = 0;
+            let speedSumKmh = 0;
+            let speedCount = 0;
+            let maxSpeedKmh = 0;
+            let activeOverspeedInView = 0;
+
             for (let i = 0; i < visibleDetections.length; i++) {
-              const cat = visibleDetections[i].category;
+              const item = visibleDetections[i];
+              const cat = item.category;
               if (cat === 'person') persons++;
               else if (cat === 'vehicle' || cat === 'bicycle') vehicles++;
               else if (cat === 'animal') animals++;
               else objects++;
+
+              if (isCocoVehicleClass(item.classId, item.className)) {
+                if (item.motionStatus === 'EN MOVIMIENTO') {
+                  movingVehicles++;
+                } else {
+                  stoppedVehicles++;
+                }
+                speedSumKmh += item.speedKmh;
+                speedCount++;
+                if (item.speedKmh > maxSpeedKmh) {
+                  maxSpeedKmh = item.speedKmh;
+                }
+                if (item.isOverspeed) {
+                  activeOverspeedInView++;
+                }
+              }
             }
 
             setCounts({
@@ -1224,6 +1383,19 @@ export function useOnnxVisionEngine({
               objects,
               total: visibleDetections.length,
             });
+
+            setTrafficTelemetry({
+              movingVehicles,
+              stoppedVehicles,
+              averageSpeedKmh:
+                speedCount > 0 ? Number((speedSumKmh / speedCount).toFixed(1)) : 0,
+              maxSpeedKmh: Number(maxSpeedKmh.toFixed(1)),
+              overspeedTotalCount: globalSpeedAlertSystem.getTotalOverspeedCount(),
+              activeOverspeedInView,
+              activeBanner: globalSpeedAlertSystem.getActiveBanner(t3),
+              countingStats: { ...globalVirtualCountingLine.getStats() },
+            });
+
             setTimings(nextEma);
             setLetterboxMeta(lb);
             const buf = planarNchwBufferRef.current;
@@ -1260,9 +1432,11 @@ export function useOnnxVisionEngine({
     isNativeOnnxSession,
     detections,
     counts,
+    trafficTelemetry,
     timings,
     letterboxMeta,
     inputSample5,
     loadCustomOnnxFile,
+    resetTrafficCounts,
   };
 }

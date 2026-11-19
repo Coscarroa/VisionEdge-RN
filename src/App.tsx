@@ -1,13 +1,19 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Camera,
+  Car,
   Compass,
   Eye,
   EyeOff,
   Flame,
+  GitCommitHorizontal,
   Radar,
   RefreshCw,
+  RotateCcw,
   SlidersHorizontal,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import {
   ARStartOverlay,
@@ -42,6 +48,8 @@ import {
   TrackedObject,
 } from './engine/cvTypes';
 import { AdaptiveThermalController } from './utils/pipelineThermal';
+import { globalSpeedAlertSystem } from './utils/SpeedAlertSystem';
+import { globalVirtualCountingLine } from './utils/VirtualCountingLine';
 
 const INITIAL_SETTINGS: PipelineSettings = {
   confidenceThreshold: 0.40,
@@ -54,6 +62,11 @@ const INITIAL_SETTINGS: PipelineSettings = {
   enableGyro: true,
   crowdBoost: false,
   isRunning: true,
+  onlyVehiclesMode: false,
+  speedLimitKmh: 60,
+  enableSpeedSoundAlert: true,
+  distanceCalibrationFactor: 1.0,
+  showCountingLine: true,
 };
 
 function mapCocoNameToTargetClass(name: string): TargetClass {
@@ -130,8 +143,18 @@ export default function App() {
   const cameraRef = useRef<WebCameraStreamHandle | null>(null);
   const radarCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const thermalControllerRef = useRef(new AdaptiveThermalController());
-  const pointerDragRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
+  const [lineEndpointsNorm, setLineEndpointsNorm] = useState(() =>
+    globalVirtualCountingLine.getEndpointsNorm()
+  );
+  const [activeDragHandle, setActiveDragHandle] = useState<'a' | 'b' | null>(null);
+  const pointerDragRef = useRef<{
+    active: boolean;
+    draggingLineHandle: 'a' | 'b' | null;
+    lastX: number;
+    lastY: number;
+  }>({
     active: false,
+    draggingLineHandle: null,
     lastX: 0,
     lastY: 0,
   });
@@ -184,7 +207,13 @@ export default function App() {
     [onNewOnnxInferenceBatch, viewportSize.width, viewportSize.height]
   );
 
-  // 2. Motor de Inferencia ONNX Runtime Web (Planar NCHW [1, 3, 640, 640], WebGPU/WASM SIMD, 80 COCO + Pose)
+  const onlyVehiclesActive = Boolean(settings.onlyVehiclesMode);
+  const speedLimitVal = settings.speedLimitKmh ?? 60;
+  const speedSoundActive = settings.enableSpeedSoundAlert ?? true;
+  const distCalibFactor = settings.distanceCalibrationFactor ?? 1.0;
+  const showCountingLineActive = settings.showCountingLine ?? true;
+
+  // 2. Motor de Inferencia ONNX Runtime Web + Modo Solo Vehículos + Velocímetro + Línea Virtual Aforo
   const {
     isEngineReady,
     engineStatusText,
@@ -192,9 +221,11 @@ export default function App() {
     activeModelName,
     detections,
     counts,
+    trafficTelemetry,
     timings,
     letterboxMeta,
     loadCustomOnnxFile,
+    resetTrafficCounts,
   } = useOnnxVisionEngine({
     videoElement,
     isCameraActive: arStarted && Boolean(videoElement),
@@ -204,6 +235,12 @@ export default function App() {
     confidenceThreshold: settings.confidenceThreshold,
     nmsIouThreshold: settings.nmsIouThreshold,
     enablePose: settings.enablePose,
+    onlyVehiclesMode: onlyVehiclesActive,
+    speedLimitKmh: speedLimitVal,
+    enableSpeedSoundAlert: speedSoundActive,
+    distanceCalibrationFactor: distCalibFactor,
+    showCountingLine: showCountingLineActive,
+    inertialStateRef,
     isPaused: !settings.isRunning,
     onNewInferenceFrame: handleNewInferenceFrame,
   });
@@ -300,12 +337,14 @@ export default function App() {
     }
 
     for (const det of detections) {
-      const col = activeTheme.categories[det.category]?.stroke ?? '#38BDF8';
+      const col = det.isOverspeed
+        ? '#EF4444'
+        : activeTheme.categories[det.category]?.stroke ?? '#38BDF8';
       const bx = Math.max(4, Math.min(w - 4, (det.centerX / Math.max(1, viewportSize.width)) * w));
       const by = Math.max(4, Math.min(h - 4, (det.centerY / Math.max(1, viewportSize.height)) * h));
       ctx.fillStyle = col;
       ctx.beginPath();
-      ctx.arc(bx, by, 3.2, 0, Math.PI * 2);
+      ctx.arc(bx, by, det.isOverspeed ? 4.2 : 3.2, 0, Math.PI * 2);
       ctx.fill();
     }
   }, [heatmapPoints, detections, radarExpanded, arStarted, settings.arTheme, viewportSize]);
@@ -314,10 +353,11 @@ export default function App() {
    * Secuencia obligatoria activada por el gesto onClick de "Iniciar Cámara AR":
    * (1) DeviceMotionEvent.requestPermission() en iOS 13+ Safari
    * (2) navigator.mediaDevices.getUserMedia + await videoElement.play()
-   * (3) Desbloqueo de audio/vibración y transición al HUD AR en vivo
+   * (3) Desbloqueo de Web Audio API (SpeedAlertSystem) y transición al HUD AR en vivo
    */
   const handleStartARCamera = useCallback(async () => {
     setCameraError(null);
+    globalSpeedAlertSystem.unlockAudioContext();
 
     setPermissionStatus((prev) => ({ ...prev, imu: 'requesting' }));
     const imuResult = await requestMobileInertialSensorsPermission();
@@ -332,6 +372,7 @@ export default function App() {
     }
 
     unlockAudioAndHapticsOnGesture();
+    globalSpeedAlertSystem.unlockAudioContext();
     setPermissionStatus((prev) => ({ ...prev, camera: 'granted' }));
     setVideoElement(videoEl);
     setArStarted(true);
@@ -375,18 +416,69 @@ export default function App() {
     setSettings((prev) => ({ ...prev, ...patch }));
   }, []);
 
+  const handleToggleVehicleMode = useCallback(() => {
+    globalSpeedAlertSystem.unlockAudioContext();
+    setSettings((prev) => {
+      const nextOnlyVehicles = !prev.onlyVehiclesMode;
+      return {
+        ...prev,
+        onlyVehiclesMode: nextOnlyVehicles,
+        showCountingLine: nextOnlyVehicles ? true : prev.showCountingLine,
+      };
+    });
+  }, []);
+
   const handleResetHeatmap = useCallback(() => {
     setHeatmapPoints([]);
   }, []);
 
-  // Soporte táctil/arrastre para probar el Filtro de Kalman inercial en escritorio
+  // Soporte táctil/arrastre para mover los nodos A y B de la Línea Virtual de Aforo o probar el Filtro de Kalman
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest('button')) return;
-    pointerDragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
+
+    let draggingHandle: 'a' | 'b' | null = null;
+    if (showCountingLineActive && viewportSize.width > 0 && viewportSize.height > 0) {
+      const { a, b } = globalVirtualCountingLine.getEndpointsPixels(
+        viewportSize.width,
+        viewportSize.height
+      );
+      const distA = Math.hypot(e.clientX - a.x, e.clientY - a.y);
+      const distB = Math.hypot(e.clientX - b.x, e.clientY - b.y);
+      const hitRadius = 32;
+      if (distA <= hitRadius || distB <= hitRadius) {
+        draggingHandle = distA <= distB ? 'a' : 'b';
+      }
+    }
+
+    setActiveDragHandle(draggingHandle);
+    pointerDragRef.current = {
+      active: true,
+      draggingLineHandle: draggingHandle,
+      lastX: e.clientX,
+      lastY: e.clientY,
+    };
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!pointerDragRef.current.active || !settings.enableGyro) return;
+    if (!pointerDragRef.current.active) return;
+
+    if (
+      pointerDragRef.current.draggingLineHandle &&
+      viewportSize.width > 0 &&
+      viewportSize.height > 0
+    ) {
+      globalVirtualCountingLine.setEndpointNorm(
+        pointerDragRef.current.draggingLineHandle,
+        e.clientX / viewportSize.width,
+        e.clientY / viewportSize.height
+      );
+      setLineEndpointsNorm({ ...globalVirtualCountingLine.getEndpointsNorm() });
+      pointerDragRef.current.lastX = e.clientX;
+      pointerDragRef.current.lastY = e.clientY;
+      return;
+    }
+
+    if (!settings.enableGyro) return;
     const dx = e.clientX - pointerDragRef.current.lastX;
     const dy = e.clientY - pointerDragRef.current.lastY;
     pointerDragRef.current.lastX = e.clientX;
@@ -396,6 +488,8 @@ export default function App() {
 
   const handlePointerUp = () => {
     pointerDragRef.current.active = false;
+    pointerDragRef.current.draggingLineHandle = null;
+    setActiveDragHandle(null);
   };
 
   const autoThermal = thermalControllerRef.current.evaluate(timings.totalMs);
@@ -415,13 +509,17 @@ export default function App() {
     postNmsCount: counts.total,
     suppressedCount: 0,
     density: densityLabel,
-    sceneLabel: facingMode === 'environment' ? 'Rear ONNX AR' : 'Front ONNX AR',
+    sceneLabel: onlyVehiclesActive
+      ? 'Radar Vehicular ONNX'
+      : facingMode === 'environment'
+      ? 'Rear ONNX AR'
+      : 'Front ONNX AR',
     timings: {
       captureMs: timings.captureMs,
       preprocessMs: timings.preprocessMs,
       yoloMs: timings.inferenceMs,
       poseMs:
-        settings.enablePose && counts.persons > 0
+        !onlyVehiclesActive && settings.enablePose && counts.persons > 0
           ? Number((timings.postprocessMs * 0.6).toFixed(1))
           : 0,
       nmsTrackMs: timings.postprocessMs,
@@ -439,6 +537,7 @@ export default function App() {
     trackId: d.trackId,
     classId: d.classId,
     className: mapCocoNameToTargetClass(d.className),
+    rawClassName: d.className,
     confidence: d.confidence,
     screenBox: d.screenBox,
     keypoints: d.keypoints,
@@ -448,6 +547,11 @@ export default function App() {
     vy: d.vy,
     centerX: d.centerX,
     centerY: d.centerY,
+    speedKmh: d.speedKmh,
+    motionStatus: d.motionStatus,
+    isOverspeed: d.isOverspeed,
+    hasCrossedLine: d.hasCrossedLine,
+    crossingDirection: d.crossingDirection,
   }));
 
   const activeThemeSpec = AR_THEMES[settings.arTheme] ?? AR_THEMES.tactical;
@@ -455,6 +559,9 @@ export default function App() {
     backgroundColor: 'rgba(11, 15, 23, 0.58)',
     borderColor: activeThemeSpec.hudBorderColor,
   };
+
+  const activeOverspeedBanner = trafficTelemetry.activeBanner;
+  const cStats = trafficTelemetry.countingStats;
 
   return (
     <div
@@ -472,12 +579,16 @@ export default function App() {
         onStreamError={handleStreamError}
       />
 
-      {/* 2. HUD AR Avanzado en Canvas HiDPI (Retículas Neón por Categoría + Estelas 15pt + Callout Pins + Kalman) */}
+      {/* 2. HUD AR Avanzado en Canvas HiDPI (Retículas + Velocímetro km/h + Alerta Roja + Línea Virtual Aforo) */}
       <ARWebCanvasOverlay
         detections={detections}
         arTheme={settings.arTheme}
-        enablePose={settings.enablePose}
+        enablePose={settings.enablePose && !onlyVehiclesActive}
         enableGyro={settings.enableGyro}
+        showCountingLine={showCountingLineActive}
+        onlyVehiclesMode={onlyVehiclesActive}
+        lineEndpointsNorm={lineEndpointsNorm}
+        activeDragHandle={activeDragHandle}
         showHeatmapOverlay={showFullHeatmapOverlay}
         heatmapPoints={heatmapPoints}
         screenWidth={viewportSize.width}
@@ -508,9 +619,13 @@ export default function App() {
               style={glassStyle}
               className="pointer-events-auto min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border flex items-center gap-2 shadow-lg"
             >
-              <span className="w-2 h-2 rounded-full bg-[#22C55E]" />
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  onlyVehiclesActive ? 'bg-[#F97316] animate-pulse' : 'bg-[#22C55E]'
+                }`}
+              />
               <span className="text-xs font-bold tracking-wide text-slate-100 whitespace-nowrap">
-                ONNX AR
+                {onlyVehiclesActive ? 'RADAR VEHICULAR' : 'ONNX AR'}
               </span>
               <span className="text-slate-500" aria-hidden="true">
                 ·
@@ -527,30 +642,83 @@ export default function App() {
             </div>
 
             <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap">
+              {/* Botón de Modo Exclusivo de Vehículos (VehicleModeToggle) */}
+              <button
+                type="button"
+                onClick={handleToggleVehicleMode}
+                title="Alternar entre Modo Universal (80 Clases COCO) y Modo Radar Solo Vehículos (Clases 1-8 + Pausa Pose)"
+                className={`min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-lg whitespace-nowrap ${
+                  onlyVehiclesActive
+                    ? 'bg-orange-500/25 border-orange-400 text-orange-200 shadow-orange-500/20'
+                    : 'bg-[#0B0F17]/65 border-slate-700/80 text-slate-100 hover:bg-slate-900/80'
+                }`}
+              >
+                <Car
+                  className={`w-3.5 h-3.5 ${
+                    onlyVehiclesActive ? 'text-orange-400' : 'text-sky-400'
+                  }`}
+                />
+                <span>
+                  {onlyVehiclesActive ? 'Modo: Solo Vehículos' : 'Modo: Todos (80 COCO)'}
+                </span>
+              </button>
+
+              {/* Controles rápidos de Línea Virtual de Aforo */}
+              <button
+                type="button"
+                onClick={() =>
+                  handleUpdateSettings({ showCountingLine: !showCountingLineActive })
+                }
+                style={glassStyle}
+                title="Mostrar u ocultar Línea Virtual de Aforo AR (Arrastra los nodos A y B en pantalla)"
+                className={`min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                  showCountingLineActive ? 'text-sky-300' : 'text-slate-400'
+                }`}
+              >
+                <GitCommitHorizontal className="w-3.5 h-3.5 text-sky-400" />
+                <span>Aforo {showCountingLineActive ? 'ON' : 'OFF'}</span>
+              </button>
+
+              {showCountingLineActive && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setLineEndpointsNorm({ ...globalVirtualCountingLine.toggleOrientation() })
+                  }
+                  style={glassStyle}
+                  title="Alternar orientación Horizontal / Vertical de la Línea Virtual"
+                  className="min-h-[42px] px-2.5 rounded-2xl backdrop-blur-md border text-[11px] font-mono font-bold text-sky-300 hover:bg-slate-900/75 transition-colors cursor-pointer shadow-lg"
+                >
+                  H/V
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={handleCycleARTheme}
                 style={glassStyle}
-                className="min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-semibold text-slate-100 hover:bg-slate-900/75 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
+                className="min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-semibold text-slate-100 hover:bg-slate-900/75 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
               >
                 <span>Estilo: {activeThemeSpec.shortLabel}</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => handleUpdateSettings({ enablePose: !settings.enablePose })}
-                style={glassStyle}
-                className={`min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
-                  settings.enablePose ? 'text-emerald-300' : 'text-slate-400'
-                }`}
-              >
-                {settings.enablePose ? (
-                  <Eye className="w-3.5 h-3.5 text-emerald-400" />
-                ) : (
-                  <EyeOff className="w-3.5 h-3.5 text-slate-400" />
-                )}
-                <span>Pose {settings.enablePose ? 'ON' : 'OFF'}</span>
-              </button>
+              {!onlyVehiclesActive && (
+                <button
+                  type="button"
+                  onClick={() => handleUpdateSettings({ enablePose: !settings.enablePose })}
+                  style={glassStyle}
+                  className={`min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap ${
+                    settings.enablePose ? 'text-emerald-300' : 'text-slate-400'
+                  }`}
+                >
+                  {settings.enablePose ? (
+                    <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : (
+                    <EyeOff className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                  <span>Pose {settings.enablePose ? 'ON' : 'OFF'}</span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -558,7 +726,7 @@ export default function App() {
                 disabled={isSwitchingCamera}
                 style={glassStyle}
                 title="Alternar entre cámara trasera y frontal"
-                className="min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border text-xs font-semibold text-sky-300 hover:bg-slate-900/75 disabled:opacity-50 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
+                className="min-h-[42px] px-3 rounded-2xl backdrop-blur-md border text-xs font-semibold text-sky-300 hover:bg-slate-900/75 disabled:opacity-50 flex items-center gap-1.5 transition-colors cursor-pointer shadow-lg whitespace-nowrap"
               >
                 {isSwitchingCamera ? (
                   <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />
@@ -570,45 +738,195 @@ export default function App() {
             </div>
           </div>
 
-          {/* Contadores en Vivo por Categoría con Colores Neón Exactos (Cian, Naranja, Esmeralda, Violeta) */}
-          <div
-            style={glassStyle}
-            className="fixed top-16 left-3 z-20 px-3.5 py-2 rounded-2xl backdrop-blur-md border flex flex-wrap items-center gap-3 text-xs shadow-md pointer-events-auto"
-          >
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-300">Personas</span>
-              <span className="font-mono font-bold text-[#38BDF8] tabular-nums">
-                {counts.persons}
-              </span>
+          {/* Banner Superior de Alerta de Exceso de Velocidad (#EF4444 Pulsante) */}
+          {activeOverspeedBanner && (
+            <div className="fixed top-16 left-1/2 -translate-x-1/2 z-30 pointer-events-auto">
+              <div className="px-4 py-2 rounded-2xl bg-red-600/90 border-2 border-red-300 text-white shadow-2xl shadow-red-600/40 flex items-center gap-2.5 animate-pulse">
+                <AlertTriangle className="w-4 h-4 text-yellow-200 shrink-0" />
+                <span className="font-mono text-xs sm:text-sm font-extrabold tracking-wide whitespace-nowrap">
+                  ⚠️ EXCESO DETECTADO: {activeOverspeedBanner.className.toUpperCase()} #
+                  {activeOverspeedBanner.trackId} • {activeOverspeedBanner.speedKmh} km/h (Límite{' '}
+                  {activeOverspeedBanner.limitKmh})
+                </span>
+              </div>
             </div>
-            <span className="text-slate-600" aria-hidden="true">
-              ·
-            </span>
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-300">Vehículos</span>
-              <span className="font-mono font-bold text-[#F97316] tabular-nums">
-                {counts.vehicles}
-              </span>
+          )}
+
+          {/* Segunda Fila Flotante: Píldoras de Telemetría (Modo Solo Vehículos vs Modo Universal) */}
+          {onlyVehiclesActive ? (
+            <div className="fixed top-16 left-3 right-3 z-20 flex flex-wrap items-center gap-2 pointer-events-none">
+              {/* Píldora 1: Aforo Total (↑ Entrada / ↓ Salida + Desglose + Reiniciar Aforo) */}
+              <div
+                style={glassStyle}
+                className="pointer-events-auto px-3.5 py-2 rounded-2xl backdrop-blur-md border flex flex-wrap items-center gap-2.5 text-xs shadow-lg"
+              >
+                <span className="font-bold text-sky-300">
+                  Aforo Total:{' '}
+                  <span className="font-mono text-white">{cStats.total}</span>
+                </span>
+                <span className="font-mono text-[11px] text-emerald-300">
+                  ↑{cStats.inbound} Entrada
+                </span>
+                <span className="font-mono text-[11px] text-cyan-300">
+                  ↓{cStats.outbound} Salida
+                </span>
+                <span className="text-slate-600 hidden sm:inline">·</span>
+                <span className="hidden sm:inline font-mono text-[11px] text-slate-300">
+                  Autos:{cStats.cars} Motos/Bicis:{cStats.twoWheelers} Pesados:
+                  {cStats.heavyVehicles}
+                </span>
+                <button
+                  type="button"
+                  onClick={resetTrafficCounts}
+                  title="Reiniciar Aforo Vehicular"
+                  className="px-2 py-0.5 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-600/80 text-[10.5px] font-semibold text-sky-300 flex items-center gap-1 cursor-pointer"
+                >
+                  <RotateCcw className="w-2.5 h-2.5" />
+                  <span>Reiniciar Aforo</span>
+                </button>
+              </div>
+
+              {/* Píldora 2: En Movimiento vs. Detenidos */}
+              <div
+                style={glassStyle}
+                className="pointer-events-auto px-3.5 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-lg"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  <span className="text-slate-300">En Mov:</span>
+                  <span className="font-mono font-bold text-emerald-300 tabular-nums">
+                    {trafficTelemetry.movingVehicles}
+                  </span>
+                </div>
+                <span className="text-slate-600">·</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-amber-400" />
+                  <span className="text-slate-300">Detenidos:</span>
+                  <span className="font-mono font-bold text-amber-300 tabular-nums">
+                    {trafficTelemetry.stoppedVehicles}
+                  </span>
+                </div>
+              </div>
+
+              {/* Píldora 3: Velocidad Promedio (Avg: XX km/h) y Contador de Excesos en Rojo */}
+              <div
+                style={glassStyle}
+                className="pointer-events-auto px-3.5 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-lg"
+              >
+                <span className="font-mono font-bold text-orange-300 tabular-nums">
+                  Avg: {trafficTelemetry.averageSpeedKmh} km/h
+                </span>
+                <span className="text-slate-600">·</span>
+                <span className="font-mono text-[11px] text-slate-300 tabular-nums">
+                  Límite: {speedLimitVal} km/h
+                </span>
+                <span className="text-slate-600">·</span>
+                <span
+                  className={`font-mono font-bold tabular-nums px-1.5 py-0.5 rounded ${
+                    trafficTelemetry.overspeedTotalCount > 0
+                      ? 'bg-red-500/25 text-red-300 border border-red-500/50 animate-pulse'
+                      : 'text-red-400'
+                  }`}
+                >
+                  Excesos: {trafficTelemetry.overspeedTotalCount}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    globalSpeedAlertSystem.unlockAudioContext();
+                    handleUpdateSettings({
+                      enableSpeedSoundAlert: !speedSoundActive,
+                    });
+                  }}
+                  title="Activar/Silenciar Alerta Sonora Web Audio API"
+                  className={`p-1 rounded-lg border transition-colors cursor-pointer ${
+                    speedSoundActive
+                      ? 'bg-red-500/20 border-red-500/40 text-red-300'
+                      : 'bg-slate-800/70 border-slate-700 text-slate-400'
+                  }`}
+                >
+                  {speedSoundActive ? (
+                    <Volume2 className="w-3.5 h-3.5" />
+                  ) : (
+                    <VolumeX className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
             </div>
-            <span className="text-slate-600" aria-hidden="true">
-              ·
-            </span>
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-300">Animales</span>
-              <span className="font-mono font-bold text-[#10B981] tabular-nums">
-                {counts.animals}
-              </span>
+          ) : (
+            <div className="fixed top-16 left-3 z-20 flex flex-wrap items-center gap-2 pointer-events-none">
+              <div
+                style={glassStyle}
+                className="pointer-events-auto px-3.5 py-2 rounded-2xl backdrop-blur-md border flex flex-wrap items-center gap-3 text-xs shadow-md"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-300">Personas</span>
+                  <span className="font-mono font-bold text-[#38BDF8] tabular-nums">
+                    {counts.persons}
+                  </span>
+                </div>
+                <span className="text-slate-600" aria-hidden="true">
+                  ·
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-300">Vehículos</span>
+                  <span className="font-mono font-bold text-[#F97316] tabular-nums">
+                    {counts.vehicles}
+                  </span>
+                </div>
+                <span className="text-slate-600" aria-hidden="true">
+                  ·
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-300">Animales</span>
+                  <span className="font-mono font-bold text-[#10B981] tabular-nums">
+                    {counts.animals}
+                  </span>
+                </div>
+                <span className="text-slate-600" aria-hidden="true">
+                  ·
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-300">Objetos</span>
+                  <span className="font-mono font-bold text-[#A855F7] tabular-nums">
+                    {counts.objects}
+                  </span>
+                </div>
+              </div>
+
+              {/* Resumen compacto de Aforo y Velocidad si hay vehículos o línea activa */}
+              {(showCountingLineActive || counts.vehicles > 0) && (
+                <div
+                  style={glassStyle}
+                  className="pointer-events-auto px-3 py-2 rounded-2xl backdrop-blur-md border flex items-center gap-2.5 text-xs shadow-md"
+                >
+                  <span className="font-mono text-sky-300 font-semibold">
+                    Aforo: {cStats.total} (↑{cStats.inbound} ↓{cStats.outbound})
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="font-mono text-orange-300 font-semibold">
+                    Avg: {trafficTelemetry.averageSpeedKmh} km/h
+                  </span>
+                  {trafficTelemetry.overspeedTotalCount > 0 && (
+                    <>
+                      <span className="text-slate-600">·</span>
+                      <span className="font-mono font-bold text-red-400">
+                        ⚠️ {trafficTelemetry.overspeedTotalCount} Exceso
+                      </span>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={resetTrafficCounts}
+                    title="Reiniciar Aforo"
+                    className="text-[10.5px] font-mono text-sky-400 hover:underline cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                </div>
+              )}
             </div>
-            <span className="text-slate-600" aria-hidden="true">
-              ·
-            </span>
-            <div className="flex items-center gap-1.5">
-              <span className="text-slate-300">Objetos</span>
-              <span className="font-mono font-bold text-[#A855F7] tabular-nums">
-                {counts.objects}
-              </span>
-            </div>
-          </div>
+          )}
 
           {/* Mini-Radar / Heatmap Flotante Colapsable en Esquina Inferior Derecha */}
           <div className="fixed bottom-16 right-3 z-20 flex flex-col items-end gap-1.5 pointer-events-auto">
@@ -694,7 +1012,9 @@ export default function App() {
               />
               <div className="flex flex-col items-start leading-tight">
                 <span className="text-xs font-semibold text-slate-100 whitespace-nowrap">
-                  {settings.enableGyro ? 'Kalman IMU + Estelas Activo' : 'Kalman IMU Pausado'}
+                  {settings.enableGyro
+                    ? 'Kalman IMU + Velocímetro Activo'
+                    : 'Kalman IMU Pausado'}
                 </span>
                 <span className="text-[10.5px] font-mono text-slate-400 tabular-nums">
                   Δx:{gyroTelemetry.offsetX >= 0 ? '+' : ''}
@@ -717,7 +1037,7 @@ export default function App() {
         </>
       )}
 
-      {/* 5. Bottom Sheet de Ajustes, Telemetría y Explorador de Código ONNX Web / RN */}
+      {/* 5. Bottom Sheet de Ajustes, Radar de Tráfico, Telemetría y Explorador de Código ONNX Web / RN */}
       <DiagnosticsModal
         visible={diagnosticsOpen}
         settings={settings}
@@ -726,8 +1046,10 @@ export default function App() {
         timeSeries={timeSeries}
         latencyHistory={latencyHistory}
         gyroTelemetry={gyroTelemetry}
+        trafficTelemetry={trafficTelemetry}
         onUpdate={handleUpdateSettings}
         onResetHeatmap={handleResetHeatmap}
+        onResetTrafficCounts={resetTrafficCounts}
         onClose={() => setDiagnosticsOpen(false)}
       />
     </div>
