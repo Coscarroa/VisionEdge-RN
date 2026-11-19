@@ -1,0 +1,6 @@
+{
+  "name": "VisionEdge RN — On-Device Computer Vision Architecture",
+  "description": "Real-time on-device YOLOv8n + MoveNet computer vision pipeline, live mobile Skia simulator, and complete React Native / Swift / Kotlin source architecture.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
