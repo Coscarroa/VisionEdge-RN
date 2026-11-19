@@ -21,14 +21,12 @@ import {
   WebCameraStream,
   WebCameraStreamHandle,
 } from './components/WebCameraStream';
+import { ARWebCanvasOverlay } from './components/ARWebCanvasOverlay';
 import {
-  ARWebCanvasOverlay,
-  WebGyroState,
-} from './components/ARWebCanvasOverlay';
-import {
-  useWebVisionEngine,
-  WebTrackedDetection,
-} from './hooks/useWebVisionEngine';
+  OnnxTrackedDetection,
+  useOnnxVisionEngine,
+} from './hooks/useOnnxVisionEngine';
+import { useInertialARTracker } from './hooks/useInertialARTracker';
 import { DiagnosticsModal } from './components/DiagnosticsModal';
 import {
   AR_THEMES,
@@ -108,7 +106,7 @@ export default function App() {
     Array<{ xNorm: number; yNorm: number; weight: number }>
   >([]);
   const [latencyHistory, setLatencyHistory] = useState<number[]>(() =>
-    Array.from({ length: 32 }, () => 19.5)
+    Array.from({ length: 32 }, () => 18.2)
   );
   const [timeSeries, setTimeSeries] = useState<TimeSeriesPoint[]>(() =>
     Array.from({ length: 20 }, (_, idx) => ({
@@ -138,14 +136,17 @@ export default function App() {
     lastY: 0,
   });
 
-  // Estado compartido a 60Hz para estabilización por giroscopio (devicemotion / deviceorientation)
-  const gyroStateRef = useRef<WebGyroState>({
-    omegaX: 0,
-    omegaY: 0,
-    omegaZ: 0,
-    offsetX: 0,
-    offsetY: 0,
-    hasHardwareSensor: false,
+  // 1. Anclaje Espacial Inercial con Filtro de Kalman + LERP (useInertialARTracker.ts)
+  const {
+    inertialStateRef,
+    onNewOnnxInferenceBatch,
+    injectPointerDelta,
+    computeAnchoredDetectionState,
+    decayInertialOffsetOnRenderFrame,
+  } = useInertialARTracker({
+    enabled: settings.enableGyro,
+    screenWidth: viewportSize.width,
+    screenHeight: viewportSize.height,
   });
 
   // Medir cambios de tamaño y orientación del navegador móvil (100vw x 100dvh)
@@ -165,9 +166,10 @@ export default function App() {
     };
   }, []);
 
-  // Callback ejecutado por cada frame con detecciones reales
+  // Callback ejecutado al llegar cada inferencia del motor ONNX
   const handleNewInferenceFrame = useCallback(
-    (newDetections: WebTrackedDetection[]) => {
+    (newDetections: OnnxTrackedDetection[]) => {
+      onNewOnnxInferenceBatch();
       if (newDetections.length > 0 && viewportSize.width > 0 && viewportSize.height > 0) {
         setHeatmapPoints((prev) => {
           const additions = newDetections.map((d) => ({
@@ -179,19 +181,21 @@ export default function App() {
         });
       }
     },
-    [viewportSize.width, viewportSize.height]
+    [onNewOnnxInferenceBatch, viewportSize.width, viewportSize.height]
   );
 
-  // 3. Motor de Inferencia Real (WebGPU -> WebGL -> WASM) + 80 Clases COCO + 17 Keypoints
+  // 2. Motor de Inferencia ONNX Runtime Web (Planar NCHW [1, 3, 640, 640], WebGPU/WASM SIMD, 80 COCO + Pose)
   const {
     isEngineReady,
     engineStatusText,
     activeBackend,
+    activeModelName,
     detections,
     counts,
     timings,
     letterboxMeta,
-  } = useWebVisionEngine({
+    loadCustomOnnxFile,
+  } = useOnnxVisionEngine({
     videoElement,
     isCameraActive: arStarted && Boolean(videoElement),
     isFrontCamera: facingMode === 'user',
@@ -211,11 +215,11 @@ export default function App() {
     }));
   }, [isEngineReady]);
 
-  // Actualizar telemetría de giroscopio y series temporales de 20s
+  // Actualizar telemetría de giroscopio Kalman y series temporales de 20s
   useEffect(() => {
     if (!arStarted) return;
     const timer = window.setInterval(() => {
-      const g = gyroStateRef.current;
+      const g = inertialStateRef.current;
       setGyroTelemetry({
         omegaX: g.omegaX,
         omegaY: g.omegaY,
@@ -228,7 +232,7 @@ export default function App() {
       setLatencyHistory((prev) => [...prev.slice(1), timings.totalMs]);
     }, 250);
     return () => window.clearInterval(timer);
-  }, [arStarted, timings.totalMs]);
+  }, [arStarted, inertialStateRef, timings.totalMs]);
 
   useEffect(() => {
     if (!arStarted) return;
@@ -307,20 +311,18 @@ export default function App() {
   }, [heatmapPoints, detections, radarExpanded, arStarted, settings.arTheme, viewportSize]);
 
   /**
-   * 1. Secuencia obligatoria activada por el gesto onClick de "Iniciar Cámara AR":
-   *    (a) Permiso explícito de DeviceMotionEvent / DeviceOrientationEvent en iOS 13+
-   *    (b) Solicitud de cámara física navigator.mediaDevices.getUserMedia + videoElement.play()
-   *    (c) Desbloqueo de contexto de audio/vibración y transición al HUD AR en vivo
+   * Secuencia obligatoria activada por el gesto onClick de "Iniciar Cámara AR":
+   * (1) DeviceMotionEvent.requestPermission() en iOS 13+ Safari
+   * (2) navigator.mediaDevices.getUserMedia + await videoElement.play()
+   * (3) Desbloqueo de audio/vibración y transición al HUD AR en vivo
    */
   const handleStartARCamera = useCallback(async () => {
     setCameraError(null);
 
-    // Paso 1: Permiso de sensores inerciales (iOS 13+ Safari requiere que ocurra en el gesto del usuario)
     setPermissionStatus((prev) => ({ ...prev, imu: 'requesting' }));
     const imuResult = await requestMobileInertialSensorsPermission();
     setPermissionStatus((prev) => ({ ...prev, imu: imuResult }));
 
-    // Paso 2: Acceso a la cámara física y reproducción inmediata con videoElement.play()
     setPermissionStatus((prev) => ({ ...prev, camera: 'requesting' }));
     const videoEl = await cameraRef.current?.startStream(facingMode);
 
@@ -329,17 +331,12 @@ export default function App() {
       return;
     }
 
-    // Paso 3: Desbloqueo de audio/vibración y transición fluida al visor AR
     unlockAudioAndHapticsOnGesture();
     setPermissionStatus((prev) => ({ ...prev, camera: 'granted' }));
     setVideoElement(videoEl);
     setArStarted(true);
   }, [facingMode]);
 
-  /**
-   * Alterna en vivo entre cámara trasera (environment) y frontal (user)
-   * deteniendo primero todos los tracks anteriores para evitar bloqueo de hardware en Android.
-   */
   const handleSwitchCamera = useCallback(async () => {
     if (!cameraRef.current || isSwitchingCamera) return;
     setIsSwitchingCamera(true);
@@ -382,7 +379,7 @@ export default function App() {
     setHeatmapPoints([]);
   }, []);
 
-  // Soporte táctil/arrastre para probar estabilización inercial también en navegadores de escritorio sin giroscopio
+  // Soporte táctil/arrastre para probar el Filtro de Kalman inercial en escritorio
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if ((e.target as HTMLElement).closest('button')) return;
     pointerDragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY };
@@ -394,19 +391,13 @@ export default function App() {
     const dy = e.clientY - pointerDragRef.current.lastY;
     pointerDragRef.current.lastX = e.clientX;
     pointerDragRef.current.lastY = e.clientY;
-
-    const g = gyroStateRef.current;
-    g.omegaY = -dx * 0.04;
-    g.omegaX = dy * 0.04;
-    g.offsetX = Math.max(-64, Math.min(64, g.offsetX + dx * 0.65));
-    g.offsetY = Math.max(-64, Math.min(64, g.offsetY + dy * 0.65));
+    injectPointerDelta(dx, dy);
   };
 
   const handlePointerUp = () => {
     pointerDragRef.current.active = false;
   };
 
-  // Adaptar métricas y tracks para el modal de diagnóstico y telemetría
   const autoThermal = thermalControllerRef.current.evaluate(timings.totalMs);
   const activeThermalMode =
     settings.thermalControlMode === 'auto' ? autoThermal.mode : settings.thermalControlMode;
@@ -424,12 +415,15 @@ export default function App() {
     postNmsCount: counts.total,
     suppressedCount: 0,
     density: densityLabel,
-    sceneLabel: facingMode === 'environment' ? 'Rear AR' : 'Front AR',
+    sceneLabel: facingMode === 'environment' ? 'Rear ONNX AR' : 'Front ONNX AR',
     timings: {
       captureMs: timings.captureMs,
       preprocessMs: timings.preprocessMs,
       yoloMs: timings.inferenceMs,
-      poseMs: settings.enablePose && counts.persons > 0 ? Number((timings.postprocessMs * 0.6).toFixed(1)) : 0,
+      poseMs:
+        settings.enablePose && counts.persons > 0
+          ? Number((timings.postprocessMs * 0.6).toFixed(1))
+          : 0,
       nmsTrackMs: timings.postprocessMs,
       renderMs: 1.4,
       totalMs: timings.totalMs,
@@ -478,7 +472,7 @@ export default function App() {
         onStreamError={handleStreamError}
       />
 
-      {/* 2. Lienzo AR HTML5 Escalado con devicePixelRatio + LERP + Sensores Giroscopio */}
+      {/* 2. HUD AR Avanzado en Canvas HiDPI (Retículas Neón por Categoría + Estelas 15pt + Callout Pins + Kalman) */}
       <ARWebCanvasOverlay
         detections={detections}
         arTheme={settings.arTheme}
@@ -488,7 +482,9 @@ export default function App() {
         heatmapPoints={heatmapPoints}
         screenWidth={viewportSize.width}
         screenHeight={viewportSize.height}
-        gyroStateRef={gyroStateRef}
+        inertialStateRef={inertialStateRef}
+        computeAnchoredDetectionState={computeAnchoredDetectionState}
+        decayInertialOffsetOnRenderFrame={decayInertialOffsetOnRenderFrame}
       />
 
       {/* 3. Pantalla Inicial Inmersiva con Botón Flotante "Iniciar Cámara AR" */}
@@ -496,24 +492,25 @@ export default function App() {
         visible={!arStarted || Boolean(cameraError)}
         engineStatusText={engineStatusText}
         activeBackend={activeBackend}
+        activeModelName={activeModelName}
         permissionStatus={permissionStatus}
         errorDetails={cameraError}
         onStartARCamera={handleStartARCamera}
+        onUploadCustomOnnxFile={(file) => loadCustomOnnxFile(file, 'detector')}
       />
 
-      {/* 4. HUD Flotante Translúcido en Vivo (Visible cuando la cámara AR está activa) */}
+      {/* 4. HUD Flotante Glassmorphism sobre 100dvh */}
       {arStarted && !cameraError && (
         <>
           {/* Barra Superior Flotante */}
           <div className="fixed top-3 left-3 right-3 z-20 flex flex-wrap items-center justify-between gap-2 pointer-events-none">
-            {/* Estado LIVE AR + FPS + Backend activo (WebGPU / WebGL / WASM) */}
             <div
               style={glassStyle}
               className="pointer-events-auto min-h-[42px] px-3.5 rounded-2xl backdrop-blur-md border flex items-center gap-2 shadow-lg"
             >
               <span className="w-2 h-2 rounded-full bg-[#22C55E]" />
               <span className="text-xs font-bold tracking-wide text-slate-100 whitespace-nowrap">
-                LIVE AR
+                ONNX AR
               </span>
               <span className="text-slate-500" aria-hidden="true">
                 ·
@@ -529,7 +526,6 @@ export default function App() {
               </span>
             </div>
 
-            {/* Botones de Acción Rápida: Estilo AR, Esqueleto 17kp y Selector Cámara Trasera/Frontal */}
             <div className="pointer-events-auto flex items-center gap-1.5 flex-wrap">
               <button
                 type="button"
@@ -556,7 +552,6 @@ export default function App() {
                 <span>Pose {settings.enablePose ? 'ON' : 'OFF'}</span>
               </button>
 
-              {/* Alternar Cámara Trasera (environment) / Frontal (user) liberando tracks previos */}
               <button
                 type="button"
                 onClick={handleSwitchCamera}
@@ -575,7 +570,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Contadores en Vivo de las 80 Clases de COCO (Personas, Vehículos, Animales, Objetos) */}
+          {/* Contadores en Vivo por Categoría con Colores Neón Exactos (Cian, Naranja, Esmeralda, Violeta) */}
           <div
             style={glassStyle}
             className="fixed top-16 left-3 z-20 px-3.5 py-2 rounded-2xl backdrop-blur-md border flex flex-wrap items-center gap-3 text-xs shadow-md pointer-events-auto"
@@ -600,7 +595,7 @@ export default function App() {
             </span>
             <div className="flex items-center gap-1.5">
               <span className="text-slate-300">Animales</span>
-              <span className="font-mono font-bold text-[#A855F7] tabular-nums">
+              <span className="font-mono font-bold text-[#10B981] tabular-nums">
                 {counts.animals}
               </span>
             </div>
@@ -609,7 +604,7 @@ export default function App() {
             </span>
             <div className="flex items-center gap-1.5">
               <span className="text-slate-300">Objetos</span>
-              <span className="font-mono font-bold text-amber-300 tabular-nums">
+              <span className="font-mono font-bold text-[#A855F7] tabular-nums">
                 {counts.objects}
               </span>
             </div>
@@ -699,7 +694,7 @@ export default function App() {
               />
               <div className="flex flex-col items-start leading-tight">
                 <span className="text-xs font-semibold text-slate-100 whitespace-nowrap">
-                  {settings.enableGyro ? 'AR + Giroscopio Activo' : 'Giroscopio Pausado'}
+                  {settings.enableGyro ? 'Kalman IMU + Estelas Activo' : 'Kalman IMU Pausado'}
                 </span>
                 <span className="text-[10.5px] font-mono text-slate-400 tabular-nums">
                   Δx:{gyroTelemetry.offsetX >= 0 ? '+' : ''}
@@ -722,7 +717,7 @@ export default function App() {
         </>
       )}
 
-      {/* 5. Bottom Sheet de Ajustes, Telemetría y Explorador de Código Web/RN */}
+      {/* 5. Bottom Sheet de Ajustes, Telemetría y Explorador de Código ONNX Web / RN */}
       <DiagnosticsModal
         visible={diagnosticsOpen}
         settings={settings}

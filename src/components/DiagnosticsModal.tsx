@@ -562,23 +562,49 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                 )}
               </section>
 
-              {/* Sección 6: Acceso Directo a los Archivos de Arquitectura Web AR (WebGPU/WASM) & React Native */}
+              {/* Sección 6: Acceso Directo a los Archivos de Arquitectura ONNX Web AR (WebGPU/WASM) */}
               <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between gap-2">
                   <div>
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                      6. Arquitectura Web AR (WebGPU / WASM) & React Native
+                      6. Arquitectura ONNX Runtime Web (WebGPU / WASM SIMD) & AR Inercial
                     </h3>
                     <p className="text-[11px] text-slate-400 mt-0.5">
                       Inspecciona el código completo listo para producción en Android e iOS
                     </p>
                   </div>
                   <span className="font-mono text-[10.5px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-400/35 text-emerald-300 shrink-0">
-                    WebGPU + 80 COCO
+                    ONNX NCHW + Kalman
                   </span>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('use-onnx-vision-engine')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-emerald-400 truncate">
+                      useOnnxVisionEngine.ts
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      Letterbox #727272 + Planar NCHW [1,3,640,640] + Stride 8400
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('use-inertial-ar-tracker')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-amber-400 truncate">
+                      useInertialARTracker.ts
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      Filtro de Kalman 1D + LERP + devicemotion 60/120Hz
+                    </div>
+                  </button>
+
                   <button
                     type="button"
                     onClick={() => handleOpenCodeFile('ar-start-overlay')}
@@ -594,32 +620,6 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
 
                   <button
                     type="button"
-                    onClick={() => handleOpenCodeFile('use-web-vision-engine')}
-                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
-                  >
-                    <div className="text-[11px] font-mono font-semibold text-emerald-400 truncate">
-                      useWebVisionEngine.ts
-                    </div>
-                    <div className="text-[10px] text-slate-400 truncate">
-                      Fallback WebGPU → WebGL → WASM + 80 Clases COCO
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleOpenCodeFile('web-camera-stream')}
-                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
-                  >
-                    <div className="text-[11px] font-mono font-semibold text-amber-400 truncate">
-                      WebCameraStream.tsx
-                    </div>
-                    <div className="text-[10px] text-slate-400 truncate">
-                      getUserMedia Progresivo + playsInline Safari/Samsung
-                    </div>
-                  </button>
-
-                  <button
-                    type="button"
                     onClick={() => handleOpenCodeFile('ar-web-canvas-overlay')}
                     className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
                   >
@@ -627,7 +627,7 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                       ARWebCanvasOverlay.tsx
                     </div>
                     <div className="text-[10px] text-slate-400 truncate">
-                      Canvas DPR + Letterbox→Cover + LERP + Gyro
+                      Retículas Neón + Estelas 15pt + Callout Pins + Pose 17kp
                     </div>
                   </button>
                 </div>

@@ -3,8 +3,11 @@ import pipelineThermalRaw from '../utils/pipelineThermal.ts?raw';
 import arThemeConfigRaw from '../config/ARThemeConfig.ts?raw';
 import arStartOverlayRaw from '../components/ARStartOverlay.tsx?raw';
 import webCameraStreamRaw from '../components/WebCameraStream.tsx?raw';
+import useOnnxVisionEngineRaw from '../hooks/useOnnxVisionEngine.ts?raw';
+import useInertialARTrackerRaw from '../hooks/useInertialARTracker.ts?raw';
 import useWebVisionEngineRaw from '../hooks/useWebVisionEngine.ts?raw';
 import arWebCanvasOverlayRaw from '../components/ARWebCanvasOverlay.tsx?raw';
+import exportOnnxWebColabRaw from '../../scripts/export_onnx_web_colab.py?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
 
@@ -19,18 +22,20 @@ export interface CodeFileNode {
   content: string;
 }
 
-export const RN_PROJECT_TREE = `VisionEdge-Web-And-RN/
+export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 ├── src/
-│   ├── App.tsx                              # Visor AR Web/Móvil 100% Edge-to-Edge + HUD Flotante + Sensores
+│   ├── App.tsx                              # Visor AR ONNX 100% Edge-to-Edge + HUD Glassmorphism + Kalman IMU
 │   ├── components/
 │   │   ├── ARStartOverlay.tsx               # Botón flotante "Iniciar Cámara AR" + Permisos iOS 13+ IMU/WebRTC
 │   │   ├── WebCameraStream.tsx              # getUserMedia progresivo + playsInline Safari/Samsung + Switch Cam
-│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HTML5 devicePixelRatio + Letterbox->Cover + LERP + Gyro
+│   │   ├── ARWebCanvasOverlay.tsx           # Canvas HiDPI + Retículas Neón + Estelas 15pt + Callout Pins + Kalman
 │   │   ├── AROverlayCanvas.tsx              # Skia AR Full-Screen (React Native) + LERP + 60Hz Gyro Offset
 │   │   ├── DetectionOverlayCanvas.tsx       # Skia PictureRecorder 60 FPS (cero re-renders)
 │   │   └── DiagnosticsModal.tsx             # Bottom Sheet (Telemetría, Gráfica 20s, Tabla y Explorador Código)
 │   ├── hooks/
-│   │   ├── useWebVisionEngine.ts            # Motor Real WebGPU -> WebGL -> WASM + 80 Clases COCO + 17kp Pose
+│   │   ├── useOnnxVisionEngine.ts           # ONNX Runtime Web (WebGPU/WASM SIMD) + Letterbox #727272 + Planar NCHW
+│   │   ├── useInertialARTracker.ts          # Filtro de Kalman 1D + LERP + devicemotion/deviceorientation 60/120Hz
+│   │   ├── useWebVisionEngine.ts            # Motor WebGPU -> WebGL -> WASM + 80 Clases COCO + 17kp Pose
 │   │   ├── useGyroARStabilization.ts        # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
 │   │   └── useResponsiveLayout.ts           # Alturas dinámicas useWindowDimensions + SafeArea
 │   ├── config/
@@ -42,23 +47,68 @@ export const RN_PROJECT_TREE = `VisionEdge-Web-And-RN/
 │   │   └── useVisionModels.ts               # Hook TFLite CoreML / GPU / NNAPI (React Native)
 │   └── processors/
 │       └── useObjectDetectionProcessor.ts   # Frame Processor JSI + resize + runSync (React Native)
-├── plugins/
-│   └── withVisionEdgeNative.js              # Config Plugin CNG: aaptOptions noCompress .tflite, GPU, iOS 15.1+
-├── app.json                                 # Expo CNG plugins (VisionCamera, FastTFLite, expo-sensors)
-└── package.json                             # Dependencias WebGPU/TF.js/ONNX Runtime Web + React Native`;
+├── scripts/
+│   └── export_onnx_web_colab.py             # Exportador Python/Colab YOLO11n + Pose -> ONNX FP32 + Validador + ZIP
+├── public/
+│   └── models/
+│       ├── yolo11n.onnx                     # Modelo YOLO11n exportado (opset=17, imgsz=640, simplify=True, FP32)
+│       └── yolo11n-pose.onnx                # Modelo YOLO11n-pose exportado (opset=17, imgsz=640, simplify=True, FP32)
+└── vite.config.ts                           # Configuración MIME/CORS para servir .onnx y .wasm sin errores`;
 
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
+  {
+    id: 'export-onnx-web-colab',
+    path: 'scripts/export_onnx_web_colab.py',
+    name: 'export_onnx_web_colab.py',
+    language: 'python',
+    deliverable: 'colab',
+    summary: 'Script Python completo para Google Colab o entorno local: descarga yolo11n.pt y yolo11n-pose.pt, los exporta a .onnx (opset=17, imgsz=640, simplify=True, dynamic=False, half=False FP32 obligatorio para WebGPU/WASM), valida nodos y dimensiones con onnxruntime.InferenceSession y empaqueta models_onnx_web.zip.',
+    highlights: [
+      'Exportación FP32 estricta (opset=17, imgsz=640, simplify=True, dynamic=False, half=False) para Safari iOS y Chrome Android',
+      'Validación automática con onnxruntime.InferenceSession sobre tensor Float32 aleatorio [1, 3, 640, 640]',
+      'Empaquetado automático en models_onnx_web.zip con estructura /public/models/ y descarga directa en Colab',
+    ],
+    content: exportOnnxWebColabRaw,
+  },
+  {
+    id: 'use-onnx-vision-engine',
+    path: 'src/hooks/useOnnxVisionEngine.ts',
+    name: 'useOnnxVisionEngine.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Motor de inferencia ONNX Runtime Web de alto rendimiento: configura ort.env.wasm.wasmPaths y ort.env.wasm.simd = true con executionProviders ["webgpu", "wasm"], preprocesa en Letterbox gris neutro (#727272, 114/255) y Tensor Planar NCHW [1, 3, 640, 640] en Float32Array [0, 1], decodifica [1, 84, 8400] y [1, 56, 8400] con stride channel * 8400 + proposalIndex, Class-Aware NMS (IoU=0.45) y ByteTrack con estela de 15 posiciones.',
+    highlights: [
+      'Preprocesamiento exacto Letterbox (#727272, 114/255) + Tensor Planar NCHW [1, 3, 640, 640] Float32Array',
+      'Decodificación transpuesta [1, 84, 8400] (stride channel * 8400 + proposalIndex) sin doble sigmoid',
+      'Bucle Zero-Freeze con requestVideoFrameCallback + bandera isInferencingRef + ByteTrack 15-pt Motion Trails',
+    ],
+    content: useOnnxVisionEngineRaw,
+  },
+  {
+    id: 'use-inertial-ar-tracker',
+    path: 'src/hooks/useInertialARTracker.ts',
+    name: 'useInertialARTracker.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Sistema de Anclaje Espacial Inercial: combina devicemotion y deviceorientation del navegador con un Filtro de Kalman 1D con velocidad (ScalarKalmanFilter) + LERP por cada trackId de ByteTrack para compensar el movimiento de la mano a 60/120 FPS sin vibración (jitter).',
+    highlights: [
+      'ScalarKalmanFilter 1D con predicción de velocidad y ganancia de Kalman para ejes Pitch/Yaw y coordenadas de caja',
+      'Fusión de devicemotion (rad/s) y deviceorientation (Euler) con reinicio sincronizado al llegar inferencia ONNX',
+      'Interpolación Kalman + LERP a 60/120 FPS para cajas delimitadoras, etiquetas y 17 keypoints articulares',
+    ],
+    content: useInertialARTrackerRaw,
+  },
   {
     id: 'ar-start-overlay',
     path: 'src/components/ARStartOverlay.tsx',
     name: 'ARStartOverlay.tsx',
     language: 'typescript',
     deliverable: 'ui',
-    summary: 'Pantalla inicial inmersiva con el botón flotante de alto contraste "Iniciar Cámara AR": ejecuta en secuencia en el gesto onClick (1) DeviceMotionEvent.requestPermission() en iOS 13+, (2) getUserMedia + video.play(), y (3) desbloqueo de WebAudio/vibración + diagnóstico de HTTPS y permisos.',
+    summary: 'Pantalla inicial inmersiva con el botón flotante de alto contraste "Iniciar Cámara AR": ejecuta en secuencia en el gesto onClick (1) DeviceMotionEvent.requestPermission() en iOS 13+, (2) getUserMedia + video.play(), y (3) desbloqueo de WebAudio/vibración + selector opcional de archivo .onnx local.',
     highlights: [
       'Secuencia estricta en gesto onClick para cumplir políticas de iOS Safari 13+ y Chrome Android',
       'Captura segura de DeviceMotionEvent.requestPermission() y DeviceOrientationEvent.requestPermission()',
-      'Diagnóstico en pantalla si el usuario accede por HTTP en vez de HTTPS o deniega permisos de cámara',
+      'Permite cargar en caliente cualquier archivo .onnx (yolo11n.onnx / yolov8n.onnx) desde el navegador',
     ],
     content: arStartOverlayRaw,
   },
@@ -96,11 +146,11 @@ export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
     name: 'ARWebCanvasOverlay.tsx',
     language: 'typescript',
     deliverable: 'ui',
-    summary: 'Lienzo AR HTML5 superpuesto a pantalla completa escalado con window.devicePixelRatio: proyecta coordenadas letterbox 640x640 hacia object-fit: cover, dibuja corner brackets tácticos, callout pins con distancia estimada (~Xm), esqueleto verde neón (#22C55E), suavizado LERP y estabilización devicemotion/deviceorientation.',
+    summary: 'HUD AR Avanzado en Canvas HiDPI (window.devicePixelRatio): dibuja retículas tácticas con brillo neón por categoría (Cian Personas, Naranja Vehículos, Esmeralda Animales, Violeta Objetos), estelas de movimiento (Motion Trails de 15 posiciones), callout pins con velocidad relativa y distancia (~2.8m), y esqueleto biomecánico.',
     highlights: [
-      'Escalado Retina/HiDPI con window.devicePixelRatio y proyección exacta letterbox -> object-fit: cover',
-      'Fusión en vivo con sensores web devicemotion (rad/s) y deviceorientation + interpolación LERP a 60 FPS',
-      'Soporte completo para los 3 estilos AR (Táctico Cian, Minimalista Nativo y Alto Contraste Industrial)',
+      'Retículas tácticas adaptables por categoría + estela punteada degradada con las últimas 15 posiciones del centroide',
+      'Callout pins con líder óptico: clase, ID ByteTrack, confianza (94%), velocidad relativa (m/s) y distancia (~2.8m)',
+      'Anclaje espacial a 60/120 FPS conectado a useInertialARTracker (Filtro de Kalman + LERP)',
     ],
     content: arWebCanvasOverlayRaw,
   },
