@@ -18,10 +18,11 @@ interface SimAgent {
 const CROSSWALK_AGENTS: SimAgent[] = [
   // Static/slow background objects grounded in the crosswalk scene
   { id: 'taxi_left', className: 'car', baseConf: 0.94, xNorm: 0.33, yNorm: 0.47, wNorm: 0.08, hNorm: 0.065, vx: 0.015, vy: 0.002, phase: 0.4 },
-  { id: 'suv_mid', className: 'car', baseConf: 0.95, xNorm: 0.67, yNorm: 0.51, wNorm: 0.11, hNorm: 0.085, vx: -0.055, vy: 0.008, phase: 1.1 },
+  { id: 'suv_mid', className: 'truck', baseConf: 0.95, xNorm: 0.67, yNorm: 0.51, wNorm: 0.11, hNorm: 0.085, vx: -0.055, vy: 0.008, phase: 1.1 },
   { id: 'tram_bus', className: 'bus', baseConf: 0.91, xNorm: 0.71, yNorm: 0.41, wNorm: 0.095, hNorm: 0.095, vx: -0.012, vy: 0.005, phase: 2.0 },
-  // Moving crosswalk pedestrians with full 17-keypoint skeletons
+  // Moving crosswalk pedestrians with full 17-keypoint skeletons + pet dog (COCO class 16)
   { id: 'ped_cross_1', className: 'person', baseConf: 0.93, xNorm: 0.24, yNorm: 0.66, wNorm: 0.075, hNorm: 0.22, vx: 0.065, vy: -0.004, phase: 0.0 },
+  { id: 'dog_cross_1', className: 'dog', baseConf: 0.89, xNorm: 0.30, yNorm: 0.74, wNorm: 0.055, hNorm: 0.085, vx: 0.065, vy: -0.004, phase: 0.3 },
   { id: 'ped_cross_2', className: 'person', baseConf: 0.89, xNorm: 0.52, yNorm: 0.64, wNorm: 0.068, hNorm: 0.20, vx: -0.052, vy: 0.003, phase: 1.8 },
   { id: 'ped_sidewalk', className: 'person', baseConf: 0.87, xNorm: 0.85, yNorm: 0.63, wNorm: 0.065, hNorm: 0.19, vx: -0.018, vy: 0.0, phase: 3.1 },
   { id: 'bike_lane_1', className: 'bicycle', baseConf: 0.88, xNorm: 0.15, yNorm: 0.69, wNorm: 0.095, hNorm: 0.13, vx: 0.085, vy: -0.005, phase: 0.7 },
@@ -30,10 +31,10 @@ const CROSSWALK_AGENTS: SimAgent[] = [
 const BOULEVARD_AGENTS: SimAgent[] = [
   { id: 'cyclist_center', className: 'bicycle', baseConf: 0.94, xNorm: 0.42, yNorm: 0.66, wNorm: 0.11, hNorm: 0.18, vx: 0.006, vy: -0.028, phase: 0.2 },
   { id: 'cyclist_rider', className: 'person', baseConf: 0.95, xNorm: 0.42, yNorm: 0.60, wNorm: 0.085, hNorm: 0.22, vx: 0.006, vy: -0.028, phase: 0.2 },
-  { id: 'cyclist_ahead', className: 'bicycle', baseConf: 0.86, xNorm: 0.59, yNorm: 0.59, wNorm: 0.065, hNorm: 0.12, vx: 0.003, vy: -0.018, phase: 1.4 },
+  { id: 'moto_ahead', className: 'motorcycle', baseConf: 0.88, xNorm: 0.59, yNorm: 0.59, wNorm: 0.07, hNorm: 0.125, vx: 0.003, vy: -0.018, phase: 1.4 },
   { id: 'rider_ahead', className: 'person', baseConf: 0.88, xNorm: 0.59, yNorm: 0.56, wNorm: 0.052, hNorm: 0.13, vx: 0.003, vy: -0.018, phase: 1.4 },
   { id: 'ped_walk_1', className: 'person', baseConf: 0.92, xNorm: 0.79, yNorm: 0.57, wNorm: 0.055, hNorm: 0.16, vx: -0.022, vy: 0.01, phase: 2.3 },
-  { id: 'ped_walk_2', className: 'person', baseConf: 0.90, xNorm: 0.84, yNorm: 0.58, wNorm: 0.055, hNorm: 0.17, vx: -0.020, vy: 0.012, phase: 0.9 },
+  { id: 'dog_plaza_1', className: 'dog', baseConf: 0.87, xNorm: 0.84, yNorm: 0.65, wNorm: 0.052, hNorm: 0.08, vx: -0.020, vy: 0.012, phase: 0.9 },
   { id: 'bus_yellow', className: 'bus', baseConf: 0.93, xNorm: 0.17, yNorm: 0.51, wNorm: 0.12, hNorm: 0.085, vx: 0.018, vy: 0.002, phase: 0.0 },
   { id: 'car_silver', className: 'car', baseConf: 0.91, xNorm: 0.18, yNorm: 0.55, wNorm: 0.10, hNorm: 0.075, vx: 0.042, vy: 0.003, phase: 1.7 },
 ];

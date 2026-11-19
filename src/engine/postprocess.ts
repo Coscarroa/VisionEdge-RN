@@ -393,16 +393,19 @@ export function countByBucket(tracks: TrackedObject[]): {
   persons: number;
   vehicles: number;
   bicycles: number;
+  animalsOther: number;
 } {
   let persons = 0;
   let vehicles = 0;
   let bicycles = 0;
+  let animalsOther = 0;
   for (const t of tracks) {
     if (t.className === 'person') persons++;
-    else if (t.className === 'car' || t.className === 'bus') vehicles++;
-    else if (t.className === 'bicycle') bicycles++;
+    else if (t.className === 'car' || t.className === 'bus' || t.className === 'truck') vehicles++;
+    else if (t.className === 'bicycle' || t.className === 'motorcycle') bicycles++;
+    else animalsOther++;
   }
-  return { persons, vehicles, bicycles };
+  return { persons, vehicles, bicycles, animalsOther };
 }
 
 export function classToId(cls: TargetClass): number {
@@ -413,7 +416,15 @@ export function classToId(cls: TargetClass): number {
       return 1;
     case 'car':
       return 2;
+    case 'motorcycle':
+      return 3;
     case 'bus':
       return 5;
+    case 'truck':
+      return 7;
+    case 'dog':
+      return 16;
+    case 'backpack':
+      return 24;
   }
 }

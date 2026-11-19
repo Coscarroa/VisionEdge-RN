@@ -1,5 +1,6 @@
 import visionPostProcessorRaw from '../utils/visionPostProcessor.ts?raw';
 import pipelineThermalRaw from '../utils/pipelineThermal.ts?raw';
+import arThemeConfigRaw from '../config/ARThemeConfig.ts?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
 
@@ -15,26 +16,30 @@ export interface CodeFileNode {
 }
 
 export const RN_PROJECT_TREE = `VisionEdgeRN/
-├── App.tsx                              # Entrada unificada (Permisos, AppState, Skia 60 FPS + Throttler 250ms)
+├── App.tsx                              # Visor AR 100% Edge-to-Edge + HUD Flotante Glassmorphism + Gyro 60Hz
 ├── plugins/
 │   └── withVisionEdgeNative.js          # Config Plugin CNG: aaptOptions noCompress .tflite, GPU, iOS 15.1+
 ├── scripts/
 │   ├── export_tflite_colab.py           # Colab FP16 export + TFLite Interpreter inspection
 │   └── build_release_free.sh            # Compilación gratuita Android & iOS Release (sin Expo Go)
 ├── src/
+│   ├── config/
+│   │   └── ARThemeConfig.ts             # 3 estilos visuales AR (Táctico Cian, Nativo Frosted, Industrial)
 │   ├── models/
-│   │   ├── yolo11n_fp16.tflite          # Detección urbana (person, bicycle, car, bus)
+│   │   ├── yolo11n_fp16.tflite          # Detección 80 clases COCO (person, vehicle, bicycle, animal, object)
 │   │   ├── yolo11n_pose_fp16.tflite     # Estimación de pose (17 keypoints COCO)
 │   │   └── useVisionModels.ts           # Hook asíncrono con delegados CoreML / GPU / NNAPI
 │   ├── processors/
-│   │   └── useObjectDetectionProcessor.ts # Frame Processor JSI + resize + runSync + SharedValue
+│   │   └── useObjectDetectionProcessor.ts # Frame Processor JSI + resize + runSync + SharedValue + Gyro Reset
 │   ├── components/
+│   │   ├── AROverlayCanvas.tsx          # Skia AR Full-Screen + LERP + 60Hz Gyro Offset + 3 estilos AR
 │   │   ├── DetectionOverlayCanvas.tsx   # Skia PictureRecorder 60 FPS (cero re-renders)
-│   │   ├── ActivityHeatmap.tsx          # Cuadrícula 32x18 + BlurMaskFilter térmico
+│   │   ├── ActivityHeatmap.tsx          # Mini-Radar / Heatmap espacial colapsable
 │   │   ├── TelemetryCharts.tsx          # Processing Speed Wave + Object Tracking 20s
 │   │   ├── LatencyBreakdownCard.tsx     # Barras EMA por etapa + Modo Térmico
-│   │   └── DiagnosticsModal.tsx         # Bottom Sheet #0F172A (4 secciones + pausa Worklet)
+│   │   └── DiagnosticsModal.tsx         # Bottom Sheet #0F172A (Telemetría, Gráfica 20s, Tabla y Ajustes)
 │   ├── hooks/
+│   │   ├── useGyroARStabilization.ts    # Giroscopio 60Hz (expo-sensors) -> SharedValue Zero-Lag Tracking
 │   │   └── useResponsiveLayout.ts       # Alturas dinámicas useWindowDimensions + SafeArea
 │   ├── utils/
 │   │   ├── visionPostProcessor.ts       # Zero-alloc YOLO decode + Class-NMS + ByteTrack + Letterbox
@@ -50,15 +55,15 @@ export const RN_PROJECT_TREE = `VisionEdgeRN/
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
   {
     id: 'app-tsx-unified',
-    path: 'App.tsx (Unified Production Entry)',
-    name: 'App.tsx (Unificado)',
+    path: 'App.tsx (Full-Screen AR HUD + 60Hz Gyro Entry)',
+    name: 'App.tsx (AR Full-Screen)',
     language: 'typescript',
     deliverable: 'project',
-    summary: 'Archivo de entrada principal listo para producción: une permisos de cámara, AppState lifecycle, carga TFLite, puente desacoplado SharedValue (60 FPS Skia) + Throttler 250ms (runOnJS), pausa/reanudación, reset heatmap y modal de ajustes con modo térmico.',
+    summary: 'Visor AR 100% Edge-to-Edge (StyleSheet.absoluteFill) con estabilización inercial predictiva a 60Hz (useGyroARStabilization), 3 temas AR intercambiables en caliente (Táctico / Nativo / Industrial) y HUD flotante translúcido Glassmorphism (rgba(11, 15, 23, 0.55)).',
     highlights: [
-      'AppState (active/background) + useCameraPermission + carga segura useVisionModels',
-      'SharedValue directo a Skia (60 FPS) + Worklets.createRunOnJS throttled cada 250 ms',
-      'Controles en vivo: Pausa/Reanudar, Reset Heatmap, Conf/IoU y Selector Térmico Auto/Manual',
+      'Cámara y Skia AROverlayCanvas 100% edge-to-edge (StyleSheet.absoluteFill) con resizeMode="cover"',
+      'Giroscopio 60Hz (expo-sensors) conectado a SharedValue + reinicio sincronizado y LERP al llegar YOLO',
+      'HUD flotante Glassmorphism con useSafeAreaInsets: Barra Superior, Contadores, Mini-Radar colapsable y Barra Inferior',
     ],
     content: `import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -70,9 +75,14 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
+  useWindowDimensions,
   View,
 } from 'react-native';
-import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import {
+  SafeAreaProvider,
+  SafeAreaView,
+  useSafeAreaInsets,
+} from 'react-native-safe-area-context';
 import {
   Camera,
   runAsync,
@@ -85,12 +95,21 @@ import { useSharedValue } from 'react-native-reanimated';
 import { Worklets } from 'react-native-worklets-core';
 
 import { useVisionModels } from './src/models/useVisionModels';
-import { useResponsiveLayout } from './src/hooks/useResponsiveLayout';
+import {
+  ARThemeId,
+  AR_THEMES,
+  AR_THEME_ORDER,
+} from './src/config/ARThemeConfig';
+import { useGyroARStabilization } from './src/hooks/useGyroARStabilization';
+import { AROverlayCanvas } from './src/components/AROverlayCanvas';
 import {
   applyClassAwareNMS,
   decodeYoloDetections,
   decodeYoloPose,
+  ensureNormalizedFloat32Input,
+  inspectYoloOutputTensor,
   ProposalPool,
+  SensorOrientation,
   SimpleByteTracker,
   TrackedObject,
 } from './src/utils/visionPostProcessor';
@@ -100,19 +119,15 @@ import {
   StageLatencyEma,
   ThermalMode,
 } from './src/utils/PipelineProfiler';
-import { DetectionOverlayCanvas } from './src/components/DetectionOverlayCanvas';
 import { ActivityHeatmap, HEATMAP_COLS, HEATMAP_ROWS } from './src/components/ActivityHeatmap';
-import {
-  ObjectTrackingChart,
-  ProcessingSpeedWave,
-  TrackingHistorySample,
-} from './src/components/TelemetryCharts';
+import { TrackingHistorySample } from './src/components/TelemetryCharts';
 import { DiagnosticsModal, ThermalControlSetting } from './src/components/DiagnosticsModal';
 
 interface JsTelemetrySnapshot {
   persons: number;
   vehicles: number;
   bicycles: number;
+  animalsOther: number;
   density: 'Low' | 'Moderate' | 'High';
   timings: StageLatencyEma;
   thermalMode: ThermalMode;
@@ -122,7 +137,7 @@ interface JsTelemetrySnapshot {
 
 const UI_THROTTLE_MS = 250;
 
-// Pools y estado persistente preasignado en el hilo Worklet (zero-allocation)
+// Pools preasignados en el hilo Worklet (zero-allocation)
 const detPool = new ProposalPool(256);
 const posePool = new ProposalPool(256);
 const nmsIndicesOut = new Int32Array(256);
@@ -133,13 +148,14 @@ const thermalController = new AdaptiveThermalController();
 export default function App() {
   return (
     <SafeAreaProvider>
-      <VisionEdgeAppScreen />
+      <VisionEdgeARHudScreen />
     </SafeAreaProvider>
   );
 }
 
-function VisionEdgeAppScreen() {
-  const layout = useResponsiveLayout();
+function VisionEdgeARHudScreen() {
+  const { width: screenWidth, height: screenHeight } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
 
   // 1. Permisos de Cámara & Ciclo de Vida AppState
   const { hasPermission, requestPermission } = useCameraPermission();
@@ -147,28 +163,36 @@ function VisionEdgeAppScreen() {
   const [cameraSide, setCameraSide] = useState<'back' | 'front'>('back');
   const [isPaused, setIsPaused] = useState(false);
 
-  // Parámetros ajustables en tiempo real
+  // Estado del HUD Flotante y Tema AR
+  const [arTheme, setArTheme] = useState<ARThemeId>('tactical');
+  const [showSkeleton, setShowSkeleton] = useState(true);
+  const [gyroEnabled, setGyroEnabled] = useState(true);
+  const [miniRadarCollapsed, setMiniRadarCollapsed] = useState(false);
+
+  // Parámetros de inferencia ajustables en vivo
   const [confThreshold, setConfThreshold] = useState(0.45);
   const [nmsIouThreshold, setNmsIouThreshold] = useState(0.45);
   const [thermalControl, setThermalControl] = useState<ThermalControlSetting>('auto');
   const [diagnosticsVisible, setDiagnosticsVisible] = useState(false);
-  const [viewportLayout, setViewportLayout] = useState({
-    width: Math.max(280, layout.width - layout.paddingHorizontal * 2),
-    height: layout.estimatedViewportHeight,
-  });
 
   const device = useCameraDevice(cameraSide);
-  const { detector, poseModel, isLoading, error, activeDelegate, reload } = useVisionModels();
+  const { detector, poseModel, isLoading, error, reload } = useVisionModels();
   const { resize } = useResizePlugin();
 
-  // Solicitud inicial elegante de permiso de cámara
+  // 2. Estabilización Predictiva con Giroscopio a 60Hz (16ms) -> SharedValue
+  const { gyroOffsetShared, resetOnNewInferenceWorklet } = useGyroARStabilization({
+    screenWidth,
+    screenHeight,
+    horizontalFovDeg: 62,
+    enabled: gyroEnabled && !isPaused,
+  });
+
   useEffect(() => {
     if (!hasPermission) {
       requestPermission().catch(() => {});
     }
   }, [hasPermission, requestPermission]);
 
-  // Detiene la cámara y libera GPU/ANE inmediatamente cuando la app pasa a segundo plano
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
       setAppState(nextState);
@@ -184,59 +208,68 @@ function VisionEdgeAppScreen() {
     !error &&
     Boolean(device);
 
-  // 2. SharedValues para renderizado Skia a 60 FPS sin cruzar por React
+  // 3. SharedValues para renderizado Skia AR a 60 FPS sin cruzar por React
   const tracksShared = useSharedValue<TrackedObject[]>([]);
+  const themeIdShared = useSharedValue<ARThemeId>(arTheme);
+  const showSkeletonShared = useSharedValue<boolean>(showSkeleton);
+  const showLabelsShared = useSharedValue<boolean>(true);
   const fpsWaveShared = useSharedValue<number[]>(new Array(30).fill(30));
   const heatmapGridShared = useSharedValue<number[]>(
     new Array(HEATMAP_COLS * HEATMAP_ROWS).fill(0)
   );
   const lastJsSyncShared = useSharedValue<number>(0);
+  const lastSmokeLogShared = useSharedValue<number>(0);
   const frameCounterShared = useSharedValue<number>(0);
 
-  // Parámetros reactivos en SharedValues para lectura directa en Worklet C++
   const confShared = useSharedValue(confThreshold);
   const iouShared = useSharedValue(nmsIouThreshold);
   const isFrontShared = useSharedValue(cameraSide === 'front');
   const thermalOverrideShared = useSharedValue<ThermalControlSetting>(thermalControl);
-  const viewportSizeShared = useSharedValue(viewportLayout);
-  // Pausar envío de tabla ByteTrack del Worklet -> JS cuando el modal está cerrado
+  const viewportSizeShared = useSharedValue({ width: screenWidth, height: screenHeight });
   const isDiagnosticsOpenShared = useSharedValue(diagnosticsVisible);
 
   useEffect(() => {
+    themeIdShared.value = arTheme;
+    showSkeletonShared.value = showSkeleton;
     confShared.value = confThreshold;
     iouShared.value = nmsIouThreshold;
     isFrontShared.value = cameraSide === 'front';
     thermalOverrideShared.value = thermalControl;
-    viewportSizeShared.value = viewportLayout;
+    viewportSizeShared.value = { width: screenWidth, height: screenHeight };
     isDiagnosticsOpenShared.value = diagnosticsVisible;
-  }, [confThreshold, nmsIouThreshold, cameraSide, thermalControl, viewportLayout, diagnosticsVisible]);
+  }, [
+    arTheme,
+    showSkeleton,
+    confThreshold,
+    nmsIouThreshold,
+    cameraSide,
+    thermalControl,
+    screenWidth,
+    screenHeight,
+    diagnosticsVisible,
+  ]);
 
-  // 3. Estado React desacoplado (actualizado únicamente cada 250 ms vía runOnJS)
-  const prevCountsRef = useRef({ persons: 0, vehicles: 0, bicycles: 0 });
+  // 4. Telemetría en JS Thread (actualizada únicamente cada 250 ms)
   const sampleTickRef = useRef(0);
-
   const [telemetry, setTelemetry] = useState({
     persons: 0,
     vehicles: 0,
     bicycles: 0,
-    deltaPersons: 0,
-    deltaVehicles: 0,
-    deltaBicycles: 0,
+    animalsOther: 0,
     density: 'Low' as 'Low' | 'Moderate' | 'High',
     thermalMode: 'Ultra' as ThermalMode,
-    rollingAvgMs: 28.0,
+    rollingAvgMs: 26.4,
     timings: {
-      captureMs: 1.6,
-      resizeMs: 2.0,
-      yoloMs: 12.1,
-      poseMs: 8.4,
-      nmsTrackMs: 1.5,
+      captureMs: 1.5,
+      resizeMs: 1.9,
+      yoloMs: 11.4,
+      poseMs: 7.7,
+      nmsTrackMs: 1.4,
       skiaRenderMs: 1.8,
-      totalMs: 27.4,
-      theoreticalFps: 36.5,
+      totalMs: 25.7,
+      theoreticalFps: 38.9,
       realFps: 30.0,
     } as StageLatencyEma,
-    activeTracksCount: 0,
     activeTracks: [] as TrackedObject[],
   });
 
@@ -244,31 +277,19 @@ function VisionEdgeAppScreen() {
     Array.from({ length: 20 }, () => ({ persons: 0, vehicles: 0, bicycles: 0 }))
   );
 
-  // Callback ejecutado en JS Thread máx. cada 250 ms
   const applyTelemetrySnapshot = useCallback((snap: JsTelemetrySnapshot) => {
-    const prev = prevCountsRef.current;
     setTelemetry((prevState) => ({
       persons: snap.persons,
       vehicles: snap.vehicles,
       bicycles: snap.bicycles,
-      deltaPersons: snap.persons - prev.persons,
-      deltaVehicles: snap.vehicles - prev.vehicles,
-      deltaBicycles: snap.bicycles - prev.bicycles,
+      animalsOther: snap.animalsOther,
       density: snap.density,
       thermalMode: snap.thermalMode,
       rollingAvgMs: snap.rollingAvgMs,
       timings: snap.timings,
-      activeTracksCount: snap.persons + snap.vehicles + snap.bicycles,
-      // Solo reemplaza la tabla cuando el modal envió tracks (visible === true)
       activeTracks: snap.activeTracks ?? prevState.activeTracks,
     }));
-    prevCountsRef.current = {
-      persons: snap.persons,
-      vehicles: snap.vehicles,
-      bicycles: snap.bicycles,
-    };
 
-    // Cada 4 ticks de 250 ms (= 1.0 s) empuja una muestra a la gráfica de 20 segundos
     sampleTickRef.current = (sampleTickRef.current + 1) % 4;
     if (sampleTickRef.current === 0) {
       setHistory20s((h) => [
@@ -278,18 +299,16 @@ function VisionEdgeAppScreen() {
     }
   }, []);
 
-  // Puente Worklets-Core -> JS Thread (compatibilidad garantizada en VisionCamera v4)
   const syncTelemetryToJs = useMemo(
     () => Worklets.createRunOnJS(applyTelemetrySnapshot),
     [applyTelemetrySnapshot]
   );
 
-  // 4. Frame Processor C++ / Worklet (6 etapas instrumentadas + Gobernador Térmico)
+  // 5. Frame Processor JSI con Reinicio Sincronizado del Giroscopio
   const frameProcessor = useFrameProcessor(
     (frame) => {
       'worklet';
       if (!detector) return;
-
       const tCaptureStart = performance.now();
 
       runAsync(frame, () => {
@@ -298,48 +317,73 @@ function VisionEdgeAppScreen() {
         const tResizeStart = performance.now();
         const captureMs = Math.max(0.1, tResizeStart - tCaptureStart);
 
-        // Etapa 2: Letterbox Resize RGB float32 [0..1] 640x640
-        const resizedBuffer = resize(frame, {
+        const rawOrientation = String(frame.orientation ?? 'portrait');
+        const sensorOrientation: SensorOrientation =
+          rawOrientation === 'landscape-right'
+            ? 90
+            : rawOrientation === 'portrait-upside-down'
+            ? 180
+            : rawOrientation === 'landscape-left'
+            ? 270
+            : 0;
+        const rotationDeg =
+          sensorOrientation === 90
+            ? '90deg'
+            : sensorOrientation === 180
+            ? '180deg'
+            : sensorOrientation === 270
+            ? '270deg'
+            : '0deg';
+
+        const expectedInType = String(detector.inputs?.[0]?.dataType ?? 'float32');
+        const rawResized = resize(frame, {
           scale: { width: 640, height: 640 },
           pixelFormat: 'rgb',
-          dataType: 'float32',
+          dataType: expectedInType === 'uint8' ? 'uint8' : 'float32',
+          rotation: rotationDeg,
         });
+        const { buffer: inputBuffer, wasRescaledFrom255 } = ensureNormalizedFloat32Input(
+          rawResized as Float32Array | Uint8Array,
+          expectedInType
+        );
 
         const tYoloStart = performance.now();
         const resizeMs = tYoloStart - tResizeStart;
 
-        // Etapa 3: Inferencia Detección FP16 (runSync cero copias)
-        const [detTensor] = detector.runSync([resizedBuffer]) as [Float32Array];
+        const [detTensor] = detector.runSync([inputBuffer]) as [Float32Array];
+        const detShape = detector.outputs?.[0]?.shape;
         const tPoseStart = performance.now();
         const yoloMs = tPoseStart - tYoloStart;
 
-        // Decisión Térmica (Automática sobre últimos 30 frames o Override Manual)
+        if (tPoseStart - lastSmokeLogShared.value >= 1000) {
+          lastSmokeLogShared.value = tPoseStart;
+          const diag = inspectYoloOutputTensor(detTensor, detShape);
+          console.log(
+            \`[TFLite SmokeTest] layout=\${diag.layout} | in[0..2]=[\${inputBuffer[0]?.toFixed(3)}, \${inputBuffer[1]?.toFixed(3)}, \${inputBuffer[2]?.toFixed(3)}] (rescaled255=\${wasRescaledFrom255}) | maxScore=\${diag.maxScore.toFixed(4)} (\${diag.bestClassName})\`
+          );
+        }
+
         const overrideMode = thermalOverrideShared.value;
-        const estFrameMs = captureMs + resizeMs + yoloMs + 10.0;
-        const autoDecision = thermalController.evaluate(estFrameMs);
+        const autoDecision = thermalController.evaluate(captureMs + resizeMs + yoloMs + 9.0);
         const activeThermalMode: ThermalMode =
           overrideMode === 'auto' ? autoDecision.mode : overrideMode;
 
         const shouldRunPose =
           Boolean(poseModel) &&
+          showSkeletonShared.value &&
           (activeThermalMode === 'Ultra' ||
             (activeThermalMode === 'Balanced' && frameIdx % 2 === 0));
 
-        const shouldUpdateHeatmap =
-          activeThermalMode !== 'Thermal Safe' || frameIdx % 4 === 0;
-
-        // Etapa 4: Inferencia Pose Estimation (17 keypoints) sujeta al gobernador térmico
         let poseTensor: Float32Array | null = null;
         if (shouldRunPose && poseModel) {
-          poseTensor = poseModel.runSync([resizedBuffer])[0] as Float32Array;
+          poseTensor = poseModel.runSync([inputBuffer])[0] as Float32Array;
         }
 
         const tPostStart = performance.now();
         const poseMs = tPostStart - tPoseStart;
 
-        // Etapa 5: Decodificación Zero-Alloc + Class-Aware NMS + ByteTrack + Letterbox -> Screen
         const confMin = confShared.value;
-        decodeYoloDetections(detTensor, confMin, 640, detPool);
+        decodeYoloDetections(detTensor, confMin, 640, detPool, detShape);
         const { keptIndices, keptCount } = applyClassAwareNMS(
           detPool,
           iouShared.value,
@@ -347,12 +391,11 @@ function VisionEdgeAppScreen() {
         );
 
         if (poseTensor) {
-          decodeYoloPose(poseTensor, confMin, 640, posePool);
+          const poseShape = poseModel?.outputs?.[0]?.shape;
+          decodeYoloPose(poseTensor, confMin, 640, posePool, poseShape);
           for (let i = 0; i < keptCount; i++) {
             const det = detPool.items[keptIndices[i]];
             if (det.classId !== 0) continue;
-
-            // Empareja persona detectada con esqueleto más cercano en espacio normalizado [0..1]
             let bestDist = 0.08;
             let bestPoseIdx = -1;
             for (let p = 0; p < posePool.count; p++) {
@@ -376,72 +419,57 @@ function VisionEdgeAppScreen() {
         }
 
         const vp = viewportSizeShared.value;
+        // Calibrado con resizeMode="cover" para anclaje espacial exacto a pantalla completa
         const tracked = byteTracker.update(detPool, keptIndices, keptCount, {
           cameraWidth: frame.width,
           cameraHeight: frame.height,
           screenWidth: vp.width,
           screenHeight: vp.height,
           tensorSize: 640,
+          orientation: sensorOrientation,
           resizeMode: 'cover',
+          inputPaddingMode: 'stretch',
           isFrontCamera: isFrontShared.value,
         });
 
-        const tSkiaStart = performance.now();
-        const nmsTrackMs = tSkiaStart - tPostStart;
-
-        // Publica tracks directo a SharedValue -> <DetectionOverlayCanvas /> a 60 FPS
+        // Publica nuevas coordenadas reales y reinicia sincronizadamente el offset del giroscopio
         tracksShared.value = tracked;
-
-        // Actualiza cuadrícula 32x18 del mapa de calor según cadencia térmica
-        if (shouldUpdateHeatmap && tracked.length > 0) {
-          const nextGrid = heatmapGridShared.value.slice();
-          for (let i = 0; i < tracked.length; i++) {
-            const tr = tracked[i];
-            if (tr.lostFrames > 0) continue;
-            const gx = Math.min(HEATMAP_COLS - 1, Math.max(0, Math.floor((tr.cx / vp.width) * HEATMAP_COLS)));
-            const gy = Math.min(HEATMAP_ROWS - 1, Math.max(0, Math.floor((tr.cy / vp.height) * HEATMAP_ROWS)));
-            nextGrid[gy * HEATMAP_COLS + gx] += 1;
-          }
-          heatmapGridShared.value = nextGrid;
-        }
+        resetOnNewInferenceWorklet();
 
         const tEnd = performance.now();
-        const skiaRenderMs = Math.max(1.2, tEnd - tSkiaStart);
+        const nmsTrackMs = tEnd - tPostStart;
         const emaTimings = profiler.recordFrame(
           captureMs,
           resizeMs,
           yoloMs,
           poseMs,
           nmsTrackMs,
-          skiaRenderMs,
+          1.6,
           tEnd
         );
 
-        fpsWaveShared.value = [
-          ...fpsWaveShared.value.slice(-29),
-          Math.min(60, emaTimings.theoreticalFps),
-        ];
-
-        // Etapa 6: Throttler estricto de 250 ms hacia React JS (pausa envío de tabla si modal cerrado)
         if (tEnd - lastJsSyncShared.value >= UI_THROTTLE_MS) {
           lastJsSyncShared.value = tEnd;
           const visible = tracked.filter((t) => t.lostFrames === 0);
           let persons = 0;
           let vehicles = 0;
           let bicycles = 0;
+          let animalsOther = 0;
           for (let i = 0; i < visible.length; i++) {
-            const cid = visible[i].classId;
-            if (cid === 0) persons++;
-            else if (cid === 1) bicycles++;
-            else if (cid === 2 || cid === 5) vehicles++;
+            const cat = visible[i].category;
+            if (cat === 'person') persons++;
+            else if (cat === 'vehicle') vehicles++;
+            else if (cat === 'bicycle') bicycles++;
+            else animalsOther++;
           }
-          const total = persons + vehicles + bicycles;
+          const total = visible.length;
           const density = total < 3 ? 'Low' : total <= 7 ? 'Moderate' : 'High';
 
           syncTelemetryToJs({
             persons,
             vehicles,
             bicycles,
+            animalsOther,
             density,
             timings: emaTimings,
             thermalMode: activeThermalMode,
@@ -451,22 +479,25 @@ function VisionEdgeAppScreen() {
         }
       });
     },
-    [detector, poseModel, resize, syncTelemetryToJs]
+    [detector, poseModel, resize, resetOnNewInferenceWorklet, syncTelemetryToJs]
   );
+
+  const cycleARTheme = useCallback(() => {
+    setArTheme((prev) => {
+      const idx = AR_THEME_ORDER.indexOf(prev);
+      return AR_THEME_ORDER[(idx + 1) % AR_THEME_ORDER.length];
+    });
+  }, []);
 
   const handleResetHeatmap = useCallback(() => {
     heatmapGridShared.value = new Array(HEATMAP_COLS * HEATMAP_ROWS).fill(0);
-  }, []);
+  }, [heatmapGridShared]);
 
-  // Pantalla de permiso de cámara denegado o pendiente
   if (!hasPermission) {
     return (
       <SafeAreaView style={styles.centerScreen}>
-        <StatusBar barStyle="light-content" backgroundColor="#0B0F17" />
+        <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
         <Text style={styles.titleLg}>Permiso de Cámara Requerido</Text>
-        <Text style={styles.subtitleCenter}>
-          VisionEdge RN ejecuta YOLO11n y estimación de pose localmente sobre tu GPU/NPU sin enviar video a la nube.
-        </Text>
         <TouchableOpacity
           style={styles.primaryBtn}
           onPress={() => requestPermission().then((ok) => !ok && Linking.openSettings())}
@@ -477,211 +508,179 @@ function VisionEdgeAppScreen() {
     );
   }
 
-  // Pantalla de carga inicial o error de modelos .tflite
   if (isLoading || error) {
     return (
       <SafeAreaView style={styles.centerScreen}>
-        <StatusBar barStyle="light-content" backgroundColor="#0B0F17" />
+        <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
         {isLoading ? (
-          <>
-            <ActivityIndicator size="large" color="#38BDF8" />
-            <Text style={styles.titleLg}>Cargando Modelos FP16 en NPU...</Text>
-            <Text style={styles.subtitleCenter}>
-              Inicializando yolo11n_fp16.tflite + yolo11n_pose_fp16.tflite
-            </Text>
-          </>
+          <ActivityIndicator size="large" color="#38BDF8" />
         ) : (
-          <>
-            <Text style={[styles.titleLg, { color: '#F43F5E' }]}>Error al cargar TFLite</Text>
-            <Text style={styles.subtitleCenter}>{error}</Text>
-            <TouchableOpacity style={styles.primaryBtn} onPress={reload}>
-              <Text style={styles.primaryBtnText}>Reintentar Inicialización</Text>
-            </TouchableOpacity>
-          </>
+          <TouchableOpacity style={styles.primaryBtn} onPress={reload}>
+            <Text style={styles.primaryBtnText}>Reintentar Carga TFLite</Text>
+          </TouchableOpacity>
         )}
       </SafeAreaView>
     );
   }
 
-  const maxBar = Math.max(1, telemetry.persons, telemetry.vehicles, telemetry.bicycles, 6);
-  const formatDelta = (d: number) => (d > 0 ? \`▲ +\${d}\` : d < 0 ? \`▼ \${d}\` : '— 0');
-  const cardWidth = Math.max(130, (layout.width - layout.paddingHorizontal * 2 - layout.gap) / 2 - 20);
-  const chartWidth = Math.max(240, layout.width - layout.paddingHorizontal * 2 - 20);
-  const modeDotColor =
-    !isCameraActive
-      ? '#F59E0B'
-      : telemetry.thermalMode === 'Thermal Safe'
-      ? '#F43F5E'
-      : telemetry.thermalMode === 'Balanced'
-      ? '#F59E0B'
-      : '#22C55E';
-
-  const handleOpenDiagnostics = useCallback(() => {
-    // Lee snapshot inmediato de SharedValue antes de abrir el modal
-    const currentVisible = tracksShared.value.filter((t) => t.lostFrames === 0);
-    setTelemetry((prev) => ({ ...prev, activeTracks: currentVisible }));
-    isDiagnosticsOpenShared.value = true;
-    setDiagnosticsVisible(true);
-  }, []);
+  const activeThemeSpec = AR_THEMES[arTheme];
 
   return (
-    <SafeAreaView style={styles.root} edges={['top', 'bottom']}>
-      <StatusBar barStyle="light-content" backgroundColor="#0B0F17" />
-      <View
-        style={[
-          styles.screenContainer,
-          { gap: layout.gap, paddingHorizontal: layout.paddingHorizontal },
-        ]}
-      >
-        {/* 1. Top Status Bar (42px / 36px en compactas) */}
-        <View style={[styles.topBar, { height: layout.topBarHeight }]}>
-          <View style={styles.rowCenter}>
-            <View
-              style={[
-                styles.statusDot,
-                { backgroundColor: isCameraActive ? '#22C55E' : '#F59E0B' },
-              ]}
-            />
-            <Text style={styles.statusTitle}>
-              {isCameraActive ? 'Camera: Online' : isPaused ? 'Camera: Paused' : 'GPU: Released'}
-            </Text>
-          </View>
+    <View style={styles.fullScreenRoot}>
+      <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
 
-          <View style={styles.rowCenter}>
-            <TouchableOpacity
-              style={styles.lensChip}
-              onPress={() => setCameraSide((s) => (s === 'back' ? 'front' : 'back'))}
-            >
-              <Text style={styles.lensChipText}>
-                {cameraSide === 'back' ? 'Rear Wide' : 'Front Cam'}
-              </Text>
-            </TouchableOpacity>
-            <Text style={styles.fpsReadout}>FPS: {telemetry.timings.realFps.toFixed(1)}</Text>
-          </View>
-        </View>
+      {/* 1. CÁMARA INMERSIVA 100% EDGE-TO-EDGE (StyleSheet.absoluteFill + resizeMode="cover") */}
+      {device && (
+        <Camera
+          style={StyleSheet.absoluteFill}
+          device={device}
+          isActive={isCameraActive}
+          frameProcessor={frameProcessor}
+          resizeMode="cover"
+          pixelFormat="yuv"
+          fps={30}
+        />
+      )}
 
-        {/* 2. Visor Principal de Cámara (flex: 1 absorbe el espacio sobrante) */}
-        <View
-          style={styles.cameraShell}
-          onLayout={(e) => {
-            const { width, height } = e.nativeEvent.layout;
-            if (width > 0 && height > 0) setViewportLayout({ width, height });
-          }}
-        >
-          {device && (
-            <Camera
-              style={StyleSheet.absoluteFill}
-              device={device}
-              isActive={isCameraActive}
-              frameProcessor={frameProcessor}
-              pixelFormat="yuv"
-              fps={30}
-            />
-          )}
-          <DetectionOverlayCanvas
-            tracksShared={tracksShared}
-            width={viewportLayout.width}
-            height={viewportLayout.height}
+      {/* 2. LIENZO SKIA AR 100% PANTALLA COMPLETA CON GIROSCOPIO 60Hz Y LERP */}
+      <AROverlayCanvas
+        tracksShared={tracksShared}
+        gyroOffsetShared={gyroOffsetShared}
+        themeIdShared={themeIdShared}
+        showSkeletonShared={showSkeletonShared}
+        showLabelsShared={showLabelsShared}
+        width={screenWidth}
+        height={screenHeight}
+      />
+
+      {/* 3. HUD FLOTANTE TRANSLÚCIDO (GLASSMORPHISM rgba(11, 15, 23, 0.55)) */}
+      {/* Barra Superior Flotante */}
+      <View style={[styles.floatingTopBar, { top: Math.max(12, insets.top + 6) }]}>
+        <View style={[styles.glassPill, { borderColor: activeThemeSpec.hudBorderColor }]}>
+          <View
+            style={[
+              styles.liveDot,
+              { backgroundColor: isCameraActive ? '#22C55E' : '#F59E0B' },
+            ]}
           />
-          <View style={styles.cameraOverlayFooter}>
-            <Text style={styles.cameraMetaText}>
-              YOLOv8n + Pose · Conf {confThreshold.toFixed(2)}
+          <Text style={styles.liveText}>LIVE AR • </Text>
+          <Text style={styles.fpsText}>{telemetry.timings.realFps.toFixed(0)} FPS</Text>
+        </View>
+
+        <View style={styles.topActionsGroup}>
+          <TouchableOpacity
+            style={[styles.glassPill, { borderColor: activeThemeSpec.hudBorderColor }]}
+            onPress={cycleARTheme}
+          >
+            <Text style={styles.actionPillText}>AR: {activeThemeSpec.shortLabel}</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.glassPill, { borderColor: activeThemeSpec.hudBorderColor }]}
+            onPress={() => setShowSkeleton((s) => !s)}
+          >
+            <Text style={styles.actionPillText}>
+              Esqueleto {showSkeleton ? 'ON' : 'OFF'}
             </Text>
-            <Text style={styles.cameraMetaText}>{activeDelegate}</Text>
-          </View>
-        </View>
+          </TouchableOpacity>
 
-        {/* 3. Fila de Contadores Rápidos (76px / 64px en compactas) */}
-        <View style={[styles.counterRow, { height: layout.counterRowHeight, gap: layout.gap }]}>
-          {[
-            { label: 'Personas', count: telemetry.persons, delta: telemetry.deltaPersons, color: '#38BDF8' },
-            { label: 'Vehículos', count: telemetry.vehicles, delta: telemetry.deltaVehicles, color: '#F97316' },
-            { label: 'Bicicletas', count: telemetry.bicycles, delta: telemetry.deltaBicycles, color: '#10B981' },
-          ].map((card) => (
-            <View
-              key={card.label}
-              style={[styles.counterCard, { paddingVertical: layout.isCompactScreen ? 5 : 7 }]}
-            >
-              <View style={styles.rowBetween}>
-                <Text style={styles.cardLabel}>{card.label}</Text>
-                <Text style={[styles.deltaText, { color: card.delta >= 0 ? '#22C55E' : '#F43F5E' }]}>
-                  {formatDelta(card.delta)}
-                </Text>
-              </View>
-              <Text style={[styles.counterValue, { fontSize: layout.counterFontSize }]}>
-                {card.count}
-              </Text>
-              <View style={styles.progressTrack}>
-                <View
-                  style={[
-                    styles.progressFill,
-                    { backgroundColor: card.color, width: \`\${(card.count / maxBar) * 100}%\` },
-                  ]}
-                />
-              </View>
-            </View>
-          ))}
-        </View>
-
-        {/* 4. Fila de Métricas y Escena (96px / 82px en compactas) */}
-        <View style={[styles.twoColRow, { height: layout.metricsRowHeight, gap: layout.gap }]}>
-          <View style={[styles.panelCard, { paddingVertical: layout.isCompactScreen ? 5 : 7 }]}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.cardLabel}>Processing Speed</Text>
-              <Text style={styles.msMeta}>{telemetry.timings.totalMs.toFixed(1)} ms</Text>
-            </View>
-            <Text style={[styles.fpsBig, layout.isCompactScreen && { fontSize: 15 }]}>
-              {telemetry.timings.theoreticalFps.toFixed(1)} FPS
-            </Text>
-            <ProcessingSpeedWave
-              fpsHistoryShared={fpsWaveShared}
-              width={cardWidth}
-              height={layout.waveHeight}
-            />
-          </View>
-
-          <View style={[styles.panelCard, { paddingVertical: layout.isCompactScreen ? 5 : 7 }]}>
-            <View style={styles.rowBetween}>
-              <Text style={styles.cardLabel}>Analysis</Text>
-              <Text style={styles.sceneTag}>Urban</Text>
-            </View>
-            <View style={styles.rowBetween}>
-              <Text style={styles.densityLabel}>Density: {telemetry.density}</Text>
-              <Text style={styles.msMeta}>n={telemetry.activeTracksCount}</Text>
-            </View>
-            <ActivityHeatmap
-              gridShared={heatmapGridShared}
-              width={cardWidth}
-              height={layout.heatmapHeight}
-              onReset={handleResetHeatmap}
-            />
-          </View>
-        </View>
-
-        {/* 5. Gráfico Temporal Object Tracking (20s) (105px / 88px en compactas) */}
-        <View style={{ height: layout.trackingChartHeight, overflow: 'hidden' }}>
-          <ObjectTrackingChart
-            samples={history20s}
-            width={chartWidth}
-            height={layout.trackingSvgHeight}
-          />
-        </View>
-
-        {/* 6. Footer Bar (48px / 42px en compactas) */}
-        <View style={[styles.footerBar, { height: layout.footerHeight }]}>
-          <View style={styles.rowCenter}>
-            <View style={[styles.statusDot, { backgroundColor: modeDotColor }]} />
-            <Text style={styles.footerStatusText}>
-              System Status: {isCameraActive ? \`Running [\${telemetry.thermalMode}]\` : 'Paused'}
-            </Text>
-          </View>
-          <TouchableOpacity style={styles.settingsBtn} onPress={handleOpenDiagnostics}>
-            <Text style={styles.settingsBtnText}>Ajustes</Text>
+          <TouchableOpacity
+            style={[styles.glassPill, { borderColor: activeThemeSpec.hudBorderColor }]}
+            onPress={() => setCameraSide((s) => (s === 'back' ? 'front' : 'back'))}
+          >
+            <Text style={styles.actionPillText}>{cameraSide === 'back' ? '1x' : 'Front'}</Text>
           </TouchableOpacity>
         </View>
       </View>
 
-      {/* Bottom Sheet Deslizable (pausa el envío de tabla desde Worklet si visible === false) */}
+      {/* Píldoras de Conteo Compactas Flotantes */}
+      <View style={[styles.floatingCountersRow, { top: Math.max(56, insets.top + 50) }]}>
+        <View style={styles.counterBadge}>
+          <View style={[styles.badgeDot, { backgroundColor: '#38BDF8' }]} />
+          <Text style={styles.badgeLabel}>Personas</Text>
+          <Text style={styles.badgeCount}>{telemetry.persons}</Text>
+        </View>
+
+        <View style={styles.counterBadge}>
+          <View style={[styles.badgeDot, { backgroundColor: '#F97316' }]} />
+          <Text style={styles.badgeLabel}>Vehículos</Text>
+          <Text style={styles.badgeCount}>{telemetry.vehicles + telemetry.bicycles}</Text>
+        </View>
+
+        <View style={styles.counterBadge}>
+          <View style={[styles.badgeDot, { backgroundColor: '#A855F7' }]} />
+          <Text style={styles.badgeLabel}>Animales/Otros</Text>
+          <Text style={styles.badgeCount}>{telemetry.animalsOther}</Text>
+        </View>
+      </View>
+
+      {/* Mini-Radar / Heatmap Flotante Colapsable en Esquina Inferior Derecha */}
+      <View
+        style={[
+          styles.floatingMiniRadarWrap,
+          { bottom: Math.max(66, insets.bottom + 56) },
+        ]}
+      >
+        {miniRadarCollapsed ? (
+          <TouchableOpacity
+            style={styles.glassPill}
+            onPress={() => setMiniRadarCollapsed(false)}
+          >
+            <Text style={styles.actionPillText}>Radar ({telemetry.density})</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.miniRadarCard}>
+            <View style={styles.miniRadarHeader}>
+              <Text style={styles.miniRadarTitle}>MINI-RADAR AR</Text>
+              <TouchableOpacity onPress={() => setMiniRadarCollapsed(true)}>
+                <Text style={styles.miniRadarCollapseBtn}>—</Text>
+              </TouchableOpacity>
+            </View>
+            <ActivityHeatmap
+              gridShared={heatmapGridShared}
+              width={132}
+              height={74}
+              onReset={handleResetHeatmap}
+            />
+          </View>
+        )}
+      </View>
+
+      {/* Barra Inferior Flotante */}
+      <View
+        style={[
+          styles.floatingBottomBar,
+          { bottom: Math.max(14, insets.bottom + 8) },
+        ]}
+      >
+        <TouchableOpacity
+          style={styles.glassPill}
+          onPress={() => setGyroEnabled((g) => !g)}
+        >
+          <View
+            style={[
+              styles.liveDot,
+              { backgroundColor: gyroEnabled ? '#22C55E' : '#94A3B8' },
+            ]}
+          />
+          <Text style={styles.statusFooterText}>
+            {gyroEnabled ? 'AR + Gyro Active (60Hz)' : 'Gyro Paused'} •{' '}
+            {telemetry.timings.totalMs.toFixed(1)}ms
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.glassPill, styles.settingsPillBtn]}
+          onPress={() => {
+            isDiagnosticsOpenShared.value = true;
+            setDiagnosticsVisible(true);
+          }}
+        >
+          <Text style={styles.settingsPillText}>Ajustes / Telemetría</Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* Bottom Sheet con Gráfica 20s, Desglose de Latencia EMA y Tabla de Objetos */}
       <DiagnosticsModal
         visible={diagnosticsVisible}
         onClose={() => {
@@ -700,14 +699,20 @@ function VisionEdgeAppScreen() {
         onChangeNmsIouThreshold={setNmsIouThreshold}
         timings={telemetry.timings}
         tracks={telemetry.activeTracks}
+        history20s={history20s}
+        fpsWaveShared={fpsWaveShared}
       />
-    </SafeAreaView>
+    </View>
   );
 }
 
+const GLASS_BG = 'rgba(11, 15, 23, 0.55)';
+
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: '#0B0F17' },
-  screenContainer: { flex: 1 },
+  fullScreenRoot: {
+    flex: 1,
+    backgroundColor: '#06090F',
+  },
   centerScreen: {
     flex: 1,
     backgroundColor: '#0B0F17',
@@ -717,87 +722,146 @@ const styles = StyleSheet.create({
     gap: 14,
   },
   titleLg: { color: '#F8FAFC', fontSize: 18, fontWeight: '700', textAlign: 'center' },
-  subtitleCenter: { color: '#94A3B8', fontSize: 13, textAlign: 'center', lineHeight: 20 },
-  primaryBtn: { backgroundColor: '#38BDF8', paddingHorizontal: 18, paddingVertical: 12, borderRadius: 12 },
+  primaryBtn: {
+    backgroundColor: '#38BDF8',
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
   primaryBtnText: { color: '#0B0F17', fontSize: 13, fontWeight: '700' },
-  topBar: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  rowCenter: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  rowBetween: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statusTitle: { color: '#F1F5F9', fontSize: 13, fontWeight: '600' },
-  lensChip: {
-    backgroundColor: '#121826',
-    borderWidth: 1,
-    borderColor: '#1E293B',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 8,
-  },
-  lensChipText: { color: '#E2E8F0', fontSize: 11, fontWeight: '600' },
-  fpsReadout: { color: '#38BDF8', fontFamily: 'JetBrainsMono-Bold', fontSize: 13 },
-  cameraShell: {
-    flex: 1,
-    borderRadius: 16,
-    overflow: 'hidden',
-    backgroundColor: '#121826',
-    borderWidth: 1,
-    borderColor: '#1E293B',
-  },
-  cameraOverlayFooter: {
+  floatingTopBar: {
     position: 'absolute',
-    bottom: 8,
     left: 12,
     right: 12,
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'center',
+    zIndex: 20,
   },
-  cameraMetaText: { color: '#CBD5E1', fontSize: 10.5, fontFamily: 'JetBrainsMono-Medium' },
-  counterRow: { flexDirection: 'row' },
-  counterCard: {
-    flex: 1,
-    backgroundColor: '#121826',
-    borderRadius: 12,
-    paddingHorizontal: 10,
+  topActionsGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  glassPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: GLASS_BG,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    justifyContent: 'space-between',
+    borderColor: 'rgba(148, 163, 184, 0.28)',
+    paddingHorizontal: 11,
+    height: 36,
+    borderRadius: 999,
   },
-  cardLabel: { color: '#94A3B8', fontSize: 11, fontWeight: '500' },
-  deltaText: { fontSize: 10, fontFamily: 'JetBrainsMono-Medium' },
-  counterValue: { color: '#FFFFFF', fontWeight: '700', fontFamily: 'JetBrainsMono-Bold' },
-  progressTrack: { height: 5, borderRadius: 3, backgroundColor: '#1E293B', overflow: 'hidden' },
-  progressFill: { height: '100%', borderRadius: 3 },
-  twoColRow: { flexDirection: 'row' },
-  panelCard: {
-    flex: 1,
-    backgroundColor: '#121826',
-    borderRadius: 12,
-    paddingHorizontal: 10,
+  liveDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  liveText: {
+    color: '#F8FAFC',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  fpsText: {
+    color: '#38BDF8',
+    fontSize: 11.5,
+    fontWeight: '700',
+    fontFamily: 'Courier',
+  },
+  actionPillText: {
+    color: '#F1F5F9',
+    fontSize: 11.5,
+    fontWeight: '600',
+  },
+  floatingCountersRow: {
+    position: 'absolute',
+    left: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    zIndex: 20,
+  },
+  counterBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: GLASS_BG,
     borderWidth: 1,
-    borderColor: '#1E293B',
-    justifyContent: 'space-between',
+    borderColor: 'rgba(148, 163, 184, 0.24)',
+    paddingHorizontal: 10,
+    height: 28,
+    borderRadius: 999,
+    gap: 5,
   },
-  msMeta: { color: '#94A3B8', fontSize: 10, fontFamily: 'JetBrainsMono-Regular' },
-  fpsBig: { color: '#F1F5F9', fontSize: 17, fontWeight: '700', fontFamily: 'JetBrainsMono-Bold' },
-  sceneTag: { color: '#CBD5E1', fontSize: 11, fontWeight: '600' },
-  densityLabel: { color: '#F59E0B', fontSize: 11.5, fontWeight: '600' },
-  footerBar: {
+  badgeDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  badgeLabel: {
+    color: '#CBD5E1',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  badgeCount: {
+    color: '#FFFFFF',
+    fontSize: 11.5,
+    fontWeight: '700',
+    fontFamily: 'Courier',
+  },
+  floatingMiniRadarWrap: {
+    position: 'absolute',
+    right: 12,
+    zIndex: 20,
+  },
+  miniRadarCard: {
+    width: 148,
+    backgroundColor: GLASS_BG,
+    borderWidth: 1,
+    borderColor: 'rgba(56, 189, 248, 0.32)',
+    borderRadius: 16,
+    padding: 8,
+    gap: 6,
+  },
+  miniRadarHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    borderTopWidth: 1,
-    borderTopColor: '#1E293B',
   },
-  footerStatusText: { color: '#CBD5E1', fontSize: 12, fontWeight: '500' },
-  settingsBtn: {
-    backgroundColor: '#121826',
-    borderWidth: 1,
-    borderColor: '#1E293B',
-    paddingHorizontal: 14,
-    paddingVertical: 7,
-    borderRadius: 10,
+  miniRadarTitle: {
+    color: '#E2E8F0',
+    fontSize: 10,
+    fontWeight: '700',
   },
-  settingsBtnText: { color: '#F1F5F9', fontSize: 12, fontWeight: '600' },
+  miniRadarCollapseBtn: {
+    color: '#94A3B8',
+    fontSize: 12,
+    fontWeight: '700',
+    paddingHorizontal: 4,
+  },
+  floatingBottomBar: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    zIndex: 20,
+  },
+  statusFooterText: {
+    color: '#E2E8F0',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  settingsPillBtn: {
+    borderColor: 'rgba(56, 189, 248, 0.45)',
+  },
+  settingsPillText: {
+    color: '#38BDF8',
+    fontSize: 11.5,
+    fontWeight: '700',
+  },
 });`,
   },
   {
@@ -1025,6 +1089,12 @@ module.exports = function withVisionEdgeNative(config) {
           "enableAndroidGpuLibraries": true
         }
       ],
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "VisionEdge RN utiliza el giroscopio a 60Hz para estabilizar las cajas y esqueletos de Realidad Aumentada en tiempo real."
+        }
+      ],
       "./plugins/withVisionEdgeNative"
     ]
   }
@@ -1109,11 +1179,13 @@ module.exports = config;`,
     "expo": "~52.0.0",
     "expo-build-properties": "~0.13.1",
     "expo-dev-client": "~5.0.0",
+    "expo-sensors": "~14.0.1",
     "react": "18.3.1",
     "react-native": "0.76.3",
     "react-native-fast-tflite": "^1.6.0",
     "react-native-gesture-handler": "^2.20.2",
     "react-native-reanimated": "^3.16.1",
+    "react-native-safe-area-context": "4.12.0",
     "react-native-vision-camera": "^4.6.2",
     "react-native-worklets-core": "^1.5.0",
     "vision-camera-resize-plugin": "^3.2.0"
@@ -1336,18 +1408,27 @@ export function tensorBoxToScreen(
     name: 'useObjectDetectionProcessor.ts',
     language: 'typescript',
     deliverable: 'inference',
-    summary: 'Frame Processor principal en JSI Worklet: resize RGB 640×640 con letterbox, inferencia síncrona C++ (runSync), medición de latencia real y escritura en SharedValue a 60 FPS.',
+    summary: 'Frame Processor principal en JSI Worklet auditado contra los 6 fallos silenciosos de TFLite: normalización float32 [0.0..1.0], orientación VisionCamera v4, layout dinámico [1,84,8400] vs [1,8400,84], escala w<=1.5, 80 clases COCO y Smoke Test a 1 Hz.',
     highlights: [
-      'vision-camera-resize-plugin a float32 RGB 640×640 normalizado [0.0..1.0]',
-      'Mide captureMs, resizeMs, inferenceMs y totalMs con performance.now()',
-      'Actualiza SharedValue<VisionFrameState> sin cruzar el puente JS ni bloquear UI',
+      'Verifica model.inputs[0].dataType y normaliza a [0.0..1.0] si resize-plugin entrega [0..255]',
+      'Detecta dinámicamente layout [1, 84, 8400] vs [1, 8400, 84] y escala [0..1] vs [0..640]',
+      'Habilita las 80 clases de COCO + Smoke Test diagnóstico 1 vez/segundo en Worklet',
     ],
     content: `import { useFrameProcessor, runAsync } from 'react-native-vision-camera';
 import { useResizePlugin } from 'vision-camera-resize-plugin';
-import { SharedValue } from 'react-native-reanimated';
+import { SharedValue, useSharedValue } from 'react-native-reanimated';
 import { TensorflowModel } from 'react-native-fast-tflite';
-import { computeLetterbox, tensorBoxToScreen } from '../utils/tensorUtils';
-import { applyClassAwareNMS, ByteTrackLite, RawDetection, TargetClass, TrackedEntity } from '../utils/nms';
+import {
+  applyClassAwareNMS,
+  decodeYoloDetections,
+  decodeYoloPose,
+  ensureNormalizedFloat32Input,
+  inspectYoloOutputTensor,
+  ProposalPool,
+  SensorOrientation,
+  SimpleByteTracker,
+  TrackedObject,
+} from '../utils/visionPostProcessor';
 
 export interface PipelineTimings {
   captureMs: number;
@@ -1359,138 +1440,693 @@ export interface PipelineTimings {
 }
 
 export interface VisionFrameState {
-  tracks: TrackedEntity[];
+  tracks: TrackedObject[];
   timings: PipelineTimings;
 }
 
-const URBAN_CLASSES: Record<number, TargetClass> = {
-  0: 'person',
-  1: 'bicycle',
-  2: 'car',
-  5: 'bus',
-};
+// Pools y buffers preasignados fuera del ciclo de frame (Zero-Allocation en Worklet C++)
+const detPool = new ProposalPool(256);
+const posePool = new ProposalPool(256);
+const nmsKeptIndices = new Int32Array(256);
+const byteTracker = new SimpleByteTracker(15, 0.28, 0.42);
 
-const tracker = new ByteTrackLite();
+/**
+ * Convierte el string frame.orientation de VisionCamera v4 al ángulo de rotación
+ * necesario para que el tensor 640x640 entre derecho al intérprete TFLite.
+ */
+function resolveFrameRotation(orientation?: string): {
+  sensorOrientation: SensorOrientation;
+  rotationDeg: '0deg' | '90deg' | '180deg' | '270deg';
+} {
+  'worklet';
+  switch (orientation) {
+    case 'landscape-right':
+      // La cámara trasera en portrait suele venir rotada 90° en el sensor nativo
+      return { sensorOrientation: 90, rotationDeg: '90deg' };
+    case 'portrait-upside-down':
+      return { sensorOrientation: 180, rotationDeg: '180deg' };
+    case 'landscape-left':
+      return { sensorOrientation: 270, rotationDeg: '270deg' };
+    case 'portrait':
+    default:
+      return { sensorOrientation: 0, rotationDeg: '0deg' };
+  }
+}
 
 export function useObjectDetectionProcessor(
   detector: TensorflowModel | null,
   poseModel: TensorflowModel | null,
   visionStateShared: SharedValue<VisionFrameState>,
   confidenceThreshold: SharedValue<number>,
+  nmsIouThreshold: SharedValue<number>,
   isFrontCamera: SharedValue<boolean>,
   viewport: { width: number; height: number }
 ) {
   const { resize } = useResizePlugin();
+  const lastSmokeLogTimestamp = useSharedValue<number>(0);
 
-  return useFrameProcessor((frame) => {
-    'worklet';
-    if (!detector) return;
-
-    const tCaptureStart = performance.now();
-
-    // Ejecución asíncrona en segundo plano para no bloquear el hilo de UI ni el feed de cámara
-    runAsync(frame, () => {
+  return useFrameProcessor(
+    (frame) => {
       'worklet';
-      const tResizeStart = performance.now();
-      const captureMs = Math.max(0.1, tResizeStart - tCaptureStart);
+      if (!detector) return;
 
-      // 1. Preprocesamiento hardware-accelerated (YUV -> RGB float32 [0..1] 640x640 con letterbox)
-      const lb = computeLetterbox(frame.width, frame.height, 640);
-      const resizedBuffer = resize(frame, {
-        scale: { width: 640, height: 640 },
-        pixelFormat: 'rgb',
-        dataType: 'float32', // float32 normalizado [0.0..1.0] para yolo11n_fp16.tflite
-      });
+      const tCaptureStart = performance.now();
 
-      const tInferStart = performance.now();
-      const resizeMs = tInferStart - tResizeStart;
+      runAsync(frame, () => {
+        'worklet';
+        const tResizeStart = performance.now();
+        const captureMs = Math.max(0.1, tResizeStart - tCaptureStart);
 
-      // 2. Inferencia síncrona en C++ / GPU / CoreML sobre el buffer nativo sin copias JS
-      const [detTensor] = detector.runSync([resizedBuffer]) as [Float32Array];
-      const poseTensor = poseModel
-        ? (poseModel.runSync([resizedBuffer])[0] as Float32Array)
-        : null;
-
-      const tPostStart = performance.now();
-      const inferenceMs = tPostStart - tInferStart;
-
-      // 3. Decodificación de tensores planos [1, 84, 8400] y [1, 56, 8400]
-      const anchors = 8400;
-      const confMin = confidenceThreshold.value;
-      const proposals: RawDetection[] = [];
-
-      for (let i = 0; i < anchors; i++) {
-        let bestCls = -1;
-        let bestScore = confMin;
-
-        for (const clsId of [0, 1, 2, 5]) {
-          const score = detTensor[(4 + clsId) * anchors + i];
-          if (score > bestScore) {
-            bestScore = score;
-            bestCls = clsId;
-          }
-        }
-        if (bestCls === -1) continue;
-
-        const cx = detTensor[0 * anchors + i] * 640;
-        const cy = detTensor[1 * anchors + i] * 640;
-        const w = detTensor[2 * anchors + i] * 640;
-        const h = detTensor[3 * anchors + i] * 640;
-
-        const box = tensorBoxToScreen(
-          cx, cy, w, h, lb,
-          frame.width, frame.height,
-          viewport.width, viewport.height,
-          isFrontCamera.value
+        // =========================================================================
+        // 1. FORMATO, ORIENTACIÓN Y NORMALIZACIÓN DEL TENSOR DE ENTRADA [0.0 .. 1.0]
+        // =========================================================================
+        const expectedDataType = String(detector.inputs?.[0]?.dataType ?? 'float32');
+        const { sensorOrientation, rotationDeg } = resolveFrameRotation(
+          String(frame.orientation ?? 'portrait')
         );
 
-        const keypoints: Array<{ x: number; y: number; score: number }> = [];
-        if (bestCls === 0 && poseTensor) {
-          for (let k = 0; k < 17; k++) {
-            const kx = poseTensor[(5 + k * 3) * anchors + i] * 640;
-            const ky = poseTensor[(5 + k * 3 + 1) * anchors + i] * 640;
-            const ks = poseTensor[(5 + k * 3 + 2) * anchors + i];
-            const kpRect = tensorBoxToScreen(
-              kx, ky, 1, 1, lb,
-              frame.width, frame.height,
-              viewport.width, viewport.height,
-              isFrontCamera.value
-            );
-            keypoints.push({ x: kpRect.x, y: kpRect.y, score: ks });
+        const rawResized = resize(frame, {
+          scale: { width: 640, height: 640 },
+          pixelFormat: 'rgb',
+          dataType: expectedDataType === 'uint8' ? 'uint8' : 'float32',
+          rotation: rotationDeg,
+        });
+
+        // Corrige el fallo silencioso donde float32/uint8 entrega [0..255] en vez de [0.0..1.0]
+        const { buffer: inputTensor, wasRescaledFrom255 } = ensureNormalizedFloat32Input(
+          rawResized as Float32Array | Uint8Array,
+          expectedDataType
+        );
+
+        const tInferStart = performance.now();
+        const resizeMs = tInferStart - tResizeStart;
+
+        // =========================================================================
+        // 2. INFERENCIA SÍNCRONA EN C++ / GPU / COREML (runSync)
+        // =========================================================================
+        const detOutputs = detector.runSync([inputTensor]);
+        const detTensor = detOutputs[0] as Float32Array;
+        const detOutputShape = detector.outputs?.[0]?.shape;
+
+        const poseTensor = poseModel
+          ? (poseModel.runSync([inputTensor])[0] as Float32Array)
+          : null;
+        const poseOutputShape = poseModel?.outputs?.[0]?.shape;
+
+        const tPostStart = performance.now();
+        const inferenceMs = tPostStart - tInferStart;
+
+        // =========================================================================
+        // 6. LOGS DE DIAGNÓSTICO TEMPORAL (SMOKE TEST — 1 VEZ POR SEGUNDO)
+        // =========================================================================
+        if (tPostStart - lastSmokeLogTimestamp.value >= 1000) {
+          lastSmokeLogTimestamp.value = tPostStart;
+          const diag = inspectYoloOutputTensor(detTensor, detOutputShape);
+
+          console.log(
+            \`[TFLite SmokeTest 1Hz] \` +
+              \`inputs=\${JSON.stringify(detector.inputs)} | \` +
+              \`outputs=\${JSON.stringify(detector.outputs)} | \` +
+              \`in[0..4]=[\${inputTensor[0]?.toFixed(4)}, \${inputTensor[1]?.toFixed(4)}, \${inputTensor[2]?.toFixed(4)}, \${inputTensor[3]?.toFixed(4)}, \${inputTensor[4]?.toFixed(4)}] \` +
+              \`(rescaledFrom255=\${wasRescaledFrom255}, rot=\${rotationDeg}) | \` +
+              \`layout=\${diag.layout} [\${diag.numChannels}x\${diag.numAnchors}] | \` +
+              \`maxScore=\${diag.maxScore.toFixed(4)} (class=\${diag.bestClassName}#\${diag.bestClassId} @anchor=\${diag.bestAnchorIndex}) | \` +
+              \`rawCoords=[cx:\${diag.rawCx.toFixed(4)}, cy:\${diag.rawCy.toFixed(4)}, w:\${diag.rawW.toFixed(4)}, h:\${diag.rawH.toFixed(4)}] \` +
+              \`(normalized0to1=\${diag.isNormalizedCoords})\`
+          );
+        }
+
+        // =========================================================================
+        // 3, 4 y 5. DECODIFICACIÓN (80 CLASES COCO, LAYOUT DINÁMICO, ESCALA w<=1.5, SIN DOBLE SIGMOID)
+        // =========================================================================
+        const confMin = confidenceThreshold.value;
+        const iouMax = nmsIouThreshold.value;
+
+        decodeYoloDetections(detTensor, confMin, 640, detPool, detOutputShape);
+        const { keptIndices, keptCount } = applyClassAwareNMS(detPool, iouMax, nmsKeptIndices);
+
+        // Si el modelo de pose está activo, asocia los 17 keypoints COCO a las personas detectadas
+        if (poseTensor) {
+          decodeYoloPose(poseTensor, confMin, 640, posePool, poseOutputShape);
+
+          for (let i = 0; i < keptCount; i++) {
+            const det = detPool.items[keptIndices[i]];
+            if (det.classId !== 0) continue; // Solo asociar esqueleto a clase 'person' (id 0)
+
+            let bestDist = 0.08;
+            let bestPoseIdx = -1;
+            for (let p = 0; p < posePool.count; p++) {
+              const candPose = posePool.items[p];
+              const dist = Math.hypot(candPose.cx - det.cx, candPose.cy - det.cy);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestPoseIdx = p;
+              }
+            }
+
+            if (bestPoseIdx >= 0) {
+              det.hasPose = true;
+              const srcKps = posePool.items[bestPoseIdx].keypoints;
+              for (let k = 0; k < 17; k++) {
+                det.keypoints[k].x = srcKps[k].x;
+                det.keypoints[k].y = srcKps[k].y;
+                det.keypoints[k].visibility = srcKps[k].visibility;
+              }
+            }
           }
         }
 
-        proposals.push({
-          classId: bestCls,
-          className: URBAN_CLASSES[bestCls],
-          confidence: bestScore,
-          box,
-          keypoints,
+        // Proyección exacta a coordenadas de pantalla + seguimiento multi-objeto ByteTrack
+        const tracked = byteTracker.update(detPool, keptIndices, keptCount, {
+          cameraWidth: frame.width,
+          cameraHeight: frame.height,
+          screenWidth: viewport.width,
+          screenHeight: viewport.height,
+          tensorSize: 640,
+          orientation: sensorOrientation,
+          resizeMode: 'cover',
+          inputPaddingMode: 'stretch',
+          isFrontCamera: isFrontCamera.value,
         });
-      }
 
-      const filtered = applyClassAwareNMS(proposals, 0.45);
-      const tracked = tracker.update(filtered);
+        const tEnd = performance.now();
+        const postprocessMs = tEnd - tPostStart;
+        const totalMs = captureMs + resizeMs + inferenceMs + postprocessMs;
 
-      const tEnd = performance.now();
-      const postprocessMs = tEnd - tPostStart;
-      const totalMs = captureMs + resizeMs + inferenceMs + postprocessMs;
+        // Publicar directamente en SharedValue para renderizado Skia a 60 FPS
+        visionStateShared.value = {
+          tracks: tracked,
+          timings: {
+            captureMs,
+            resizeMs,
+            inferenceMs,
+            postprocessMs,
+            totalMs,
+            fps: Math.min(60, 1000 / Math.max(1, totalMs)),
+          },
+        };
+      });
+    },
+    [detector, poseModel, resize, viewport.width, viewport.height]
+  );
+}`,
+  },
+  {
+    id: 'ar-theme-config',
+    path: 'src/config/ARThemeConfig.ts',
+    name: 'ARThemeConfig.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Sistema de Estilos Visuales AR Intercambiables: define los 3 modos en vivo (Táctico / Futurista Cian #38BDF8 con esqueleto #22C55E, Minimalista Cámara Nativa frosted glass y Alto Contraste Industrial #FACC15/#F97316) más estimación geométrica de distancia en metros.',
+    highlights: [
+      '3 modos AR intercambiables en caliente: tactical, native e industrial',
+      'Paleta semántica completa para personas, vehículos, bicicletas/motos, animales y objetos',
+      'Función worklet estimateObjectDistanceMeters (~1.2m a ~25.0m) basada en altura proyectada',
+    ],
+    content: arThemeConfigRaw,
+  },
+  {
+    id: 'gyro-ar-stabilization',
+    path: 'src/hooks/useGyroARStabilization.ts',
+    name: 'useGyroARStabilization.ts',
+    language: 'typescript',
+    deliverable: 'inference',
+    summary: 'Hook de estabilización predictiva AR a 60Hz (16ms) con Gyroscope de expo-sensors y SharedValue de Reanimated: integra velocidad angular (rad/s) en desplazamiento sub-frame (offsetX, offsetY) entre inferencias de YOLO y aplica reinicio sincronizado con decaimiento suave.',
+    highlights: [
+      'Muestreo a 60Hz (16ms) con Gyroscope.setUpdateInterval(16) directo a SharedValue (0 re-renders JS)',
+      'Compensación Inter-Frame (Zero-Lag Tracking) proporcional a la distancia focal del visor',
+      'Reinicio sincronizado (resetOnNewInferenceWorklet) al llegar cada nueva detección de YOLO',
+    ],
+    content: `import { useEffect, useCallback } from 'react';
+import { Gyroscope } from 'expo-sensors';
+import { SharedValue, useSharedValue } from 'react-native-reanimated';
 
-      // 4. Publicar directamente en SharedValue para renderizado Skia a 60 FPS
-      visionStateShared.value = {
-        tracks: tracked,
-        timings: {
-          captureMs,
-          resizeMs,
-          inferenceMs,
-          postprocessMs,
-          totalMs,
-          fps: Math.min(60, 1000 / Math.max(1, totalMs)),
-        },
+export interface GyroAROffset {
+  /** Desplazamiento horizontal acumulado en píxeles desde la última inferencia YOLO */
+  offsetX: number;
+  /** Desplazamiento vertical acumulado en píxeles desde la última inferencia YOLO */
+  offsetY: number;
+  /** Velocidad angular instantánea (rad/s) */
+  omegaX: number;
+  omegaY: number;
+  omegaZ: number;
+  /** Marca de tiempo del último muestreo IMU (ms) */
+  lastTimestampMs: number;
+}
+
+export interface UseGyroARStabilizationOptions {
+  /** Ancho de pantalla en píxeles para calibrar ganancia angular -> píxeles */
+  screenWidth: number;
+  /** Alto de pantalla en píxeles */
+  screenHeight: number;
+  /** Campo de visión horizontal aproximado de la cámara (grados). Por defecto 62° (lente 1x) */
+  horizontalFovDeg?: number;
+  /** Activar o pausar la estabilización inercial */
+  enabled?: boolean;
+}
+
+export interface UseGyroARStabilizationResult {
+  /** SharedValue leído directamente en Skia UI Worklet a 60/120 FPS sin pasar por React */
+  gyroOffsetShared: SharedValue<GyroAROffset>;
+  /** Worklet invocado inmediatamente cuando YOLO publica una nueva inferencia */
+  resetOnNewInferenceWorklet: () => void;
+}
+
+/**
+ * Estabilización Inercial Predictiva (Zero-Lag AR Tracking) a 60Hz (16ms).
+ *
+ * Entre dos inferencias de YOLOv8n (~25-30 ms), el usuario puede rotar el teléfono
+ * provocando que las cajas se queden atrás respecto al mundo real.
+ * Este hook integra la velocidad angular del giroscopio (rad/s) y desplaza en sentido
+ * inverso todas las cajas, etiquetas y esqueletos en Skia hasta que llega el nuevo frame.
+ */
+export function useGyroARStabilization({
+  screenWidth,
+  screenHeight,
+  horizontalFovDeg = 62,
+  enabled = true,
+}: UseGyroARStabilizationOptions): UseGyroARStabilizationResult {
+  const gyroOffsetShared = useSharedValue<GyroAROffset>({
+    offsetX: 0,
+    offsetY: 0,
+    omegaX: 0,
+    omegaY: 0,
+    omegaZ: 0,
+    lastTimestampMs: 0,
+  });
+
+  // Distancia focal equivalente en píxeles por radián: f_px = (W / 2) / tan(FOV / 2)
+  const fovRad = (horizontalFovDeg * Math.PI) / 180;
+  const focalPixelsPerRad = screenWidth / (2 * Math.tan(fovRad / 2));
+  const maxClampX = screenWidth * 0.18;
+  const maxClampY = screenHeight * 0.18;
+
+  useEffect(() => {
+    if (!enabled) {
+      gyroOffsetShared.value = {
+        offsetX: 0,
+        offsetY: 0,
+        omegaX: 0,
+        omegaY: 0,
+        omegaZ: 0,
+        lastTimestampMs: Date.now(),
+      };
+      return;
+    }
+
+    // 60Hz (16ms) para empatar con el refresh rate de Skia sin saturar el bridge
+    Gyroscope.setUpdateInterval(16);
+
+    const subscription = Gyroscope.addListener((imuData) => {
+      const now = Date.now();
+      const prev = gyroOffsetShared.value;
+      const dtSec =
+        prev.lastTimestampMs > 0
+          ? Math.min(0.06, Math.max(0.004, (now - prev.lastTimestampMs) / 1000))
+          : 0.016;
+
+      // En orientación portrait:
+      // - Rotación Yaw (eje Y del dispositivo, imuData.y) desplaza la escena horizontalmente (-deltaX)
+      // - Rotación Pitch (eje X del dispositivo, imuData.x) desplaza la escena verticalmente (+deltaY)
+      // Filtro de zona muerta (deadzone) de 0.015 rad/s para ignorar ruido térmico del MEMS
+      const wy = Math.abs(imuData.y) > 0.015 ? imuData.y : 0;
+      const wx = Math.abs(imuData.x) > 0.015 ? imuData.x : 0;
+
+      const deltaPxX = -wy * dtSec * focalPixelsPerRad;
+      const deltaPxY = wx * dtSec * focalPixelsPerRad;
+
+      // Factor de amortiguación suave (0.94) para evitar deriva infinita si YOLO tarda más de 40ms
+      const nextX = Math.max(-maxClampX, Math.min(maxClampX, (prev.offsetX + deltaPxX) * 0.94));
+      const nextY = Math.max(-maxClampY, Math.min(maxClampY, (prev.offsetY + deltaPxY) * 0.94));
+
+      gyroOffsetShared.value = {
+        offsetX: nextX,
+        offsetY: nextY,
+        omegaX: imuData.x,
+        omegaY: imuData.y,
+        omegaZ: imuData.z,
+        lastTimestampMs: now,
       };
     });
-  }, [detector, poseModel, viewport.width, viewport.height]);
+
+    return () => {
+      subscription.remove();
+    };
+  }, [enabled, focalPixelsPerRad, gyroOffsetShared, maxClampX, maxClampY]);
+
+  /**
+   * Reinicio sincronizado: se llama justo al publicar una nueva inferencia de YOLO.
+   * Las nuevas cajas ya reflejan la pose física actual de la cámara, por lo que el
+   * offset acumulado se amortigua suavemente hacia 0 mientras el LERP absorbe la transición.
+   */
+  const resetOnNewInferenceWorklet = useCallback(() => {
+    'worklet';
+    const cur = gyroOffsetShared.value;
+    gyroOffsetShared.value = {
+      offsetX: cur.offsetX * 0.2,
+      offsetY: cur.offsetY * 0.2,
+      omegaX: cur.omegaX,
+      omegaY: cur.omegaY,
+      omegaZ: cur.omegaZ,
+      lastTimestampMs: cur.lastTimestampMs,
+    };
+  }, [gyroOffsetShared]);
+
+  return {
+    gyroOffsetShared,
+    resetOnNewInferenceWorklet,
+  };
 }`,
+  },
+  {
+    id: 'ar-overlay-canvas',
+    path: 'src/components/AROverlayCanvas.tsx',
+    name: 'AROverlayCanvas.tsx',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Lienzo Skia de Realidad Aumentada a pantalla completa (StyleSheet.absoluteFill) con suavizado LERP por Track ID, compensación inercial de giroscopio a 60Hz y renderizado de los 3 estilos visuales (Táctico Cian con corner brackets + pin guía + distancia ~3.2m, Nativo e Industrial).',
+    highlights: [
+      'Interpolación lineal (LERP) en UI Worklet entre inferencias YOLO + suma de offset inercial 60Hz',
+      '3 estilos visuales AR completos: Táctico (#38BDF8 + #22C55E), Nativo (Frosted White) e Industrial (#FACC15)',
+      'Retícula de horizonte reactiva al giroscopio, corner brackets ópticos y callout pins con distancia en metros',
+    ],
+    content: `import React, { useMemo } from 'react';
+import { StyleSheet } from 'react-native';
+import {
+  Canvas,
+  Picture,
+  Skia,
+  createPicture,
+  matchFont,
+  PaintStyle,
+  StrokeCap,
+} from '@shopify/react-native-skia';
+import { SharedValue, useDerivedValue, useSharedValue } from 'react-native-reanimated';
+import { TrackedObject } from '../utils/visionPostProcessor';
+import {
+  ARThemeId,
+  AR_THEMES,
+  estimateObjectDistanceMeters,
+} from '../config/ARThemeConfig';
+import { GyroAROffset } from '../hooks/useGyroARStabilization';
+
+const SKELETON_EDGES: ReadonlyArray<[number, number]> = [
+  [0, 1], [0, 2], [1, 3], [2, 4],
+  [5, 6], [5, 7], [7, 9], [6, 8], [8, 10],
+  [5, 11], [6, 12], [11, 12],
+  [11, 13], [13, 15], [12, 14], [14, 16],
+];
+
+interface LerpBoxState {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  updatedAtFrame: number;
+}
+
+export interface AROverlayCanvasProps {
+  tracksShared: SharedValue<TrackedObject[]>;
+  gyroOffsetShared: SharedValue<GyroAROffset>;
+  themeIdShared: SharedValue<ARThemeId>;
+  showSkeletonShared: SharedValue<boolean>;
+  showLabelsShared: SharedValue<boolean>;
+  lerpFactor?: number;
+  width: number;
+  height: number;
+}
+
+export const AROverlayCanvas: React.FC<AROverlayCanvasProps> = ({
+  tracksShared,
+  gyroOffsetShared,
+  themeIdShared,
+  showSkeletonShared,
+  showLabelsShared,
+  lerpFactor = 0.38,
+  width,
+  height,
+}) => {
+  const tacticalFont = useMemo(
+    () => matchFont({ fontFamily: 'Courier', fontSize: 10.5, fontWeight: '700' }),
+    []
+  );
+  const nativeFont = useMemo(
+    () => matchFont({ fontFamily: 'System', fontSize: 11, fontWeight: '600' }),
+    []
+  );
+
+  // Diccionario persistente en el UI Worklet para interpolación LERP suave por track.id
+  const lerpCacheShared = useSharedValue<Record<number, LerpBoxState>>({});
+  const frameTickShared = useSharedValue<number>(0);
+
+  const arPicture = useDerivedValue(() => {
+    'worklet';
+    const tracks = tracksShared.value;
+    const gyro = gyroOffsetShared.value;
+    const themeId = themeIdShared.value;
+    const theme = AR_THEMES[themeId] ?? AR_THEMES.tactical;
+    const showSkeleton = showSkeletonShared.value;
+    const showLabels = showLabelsShared.value;
+
+    const tick = frameTickShared.value + 1;
+    frameTickShared.value = tick;
+    const cache = lerpCacheShared.value;
+
+    return createPicture((canvas) => {
+      const paint = Skia.Paint();
+      paint.setAntiAlias(true);
+
+      // =======================================================================
+      // 1. RETÍCULA CENTRAL DE HORIZONTE (MODO TÁCTICO / INDUSTRIAL)
+      // =======================================================================
+      if (theme.showHorizonReticle) {
+        const cx = width * 0.5 + gyro.offsetX * 0.45;
+        const cy = height * 0.5 + gyro.offsetY * 0.45;
+
+        paint.setStyle(PaintStyle.Stroke);
+        paint.setStrokeWidth(1);
+        paint.setColor(Skia.Color(themeId === 'tactical' ? 'rgba(56, 189, 248, 0.28)' : 'rgba(250, 204, 21, 0.28)'));
+
+        canvas.drawCircle(cx, cy, 22, paint);
+        canvas.drawLine(cx - 38, cy, cx - 12, cy, paint);
+        canvas.drawLine(cx + 12, cy, cx + 38, cy, paint);
+        canvas.drawLine(cx, cy - 26, cx, cy - 10, paint);
+        canvas.drawLine(cx, cy + 10, cx, cy + 26, paint);
+      }
+
+      // =======================================================================
+      // 2. TRAZADO DE OBJETOS CON LERP + COMPENSACIÓN INERCIAL DE GIROSCOPIO
+      // =======================================================================
+      const font = theme.useMonospaceFont ? tacticalFont : nativeFont;
+
+      for (let i = 0; i < tracks.length; i++) {
+        const track = tracks[i];
+        const palette = theme.categories[track.category] ?? theme.categories.object;
+
+        // Interpolación Lineal (LERP) hacia las coordenadas reales de YOLO
+        const prev = cache[track.id];
+        let smoothX = track.box.x;
+        let smoothY = track.box.y;
+        let smoothW = track.box.width;
+        let smoothH = track.box.height;
+
+        if (prev && tick - prev.updatedAtFrame <= 15) {
+          smoothX = prev.x + (track.box.x - prev.x) * lerpFactor;
+          smoothY = prev.y + (track.box.y - prev.y) * lerpFactor;
+          smoothW = prev.width + (track.box.width - prev.width) * lerpFactor;
+          smoothH = prev.height + (track.box.height - prev.height) * lerpFactor;
+        }
+
+        cache[track.id] = {
+          x: smoothX,
+          y: smoothY,
+          width: smoothW,
+          height: smoothH,
+          updatedAtFrame: tick,
+        };
+
+        // Suma del desplazamiento predictivo del giroscopio (Zero-Lag Tracking)
+        const bx = Math.max(0, Math.min(width - 8, smoothX + gyro.offsetX));
+        const by = Math.max(0, Math.min(height - 8, smoothY + gyro.offsetY));
+        const bw = Math.max(8, Math.min(width - bx, smoothW));
+        const bh = Math.max(8, Math.min(height - by, smoothH));
+
+        const rect = Skia.XYWHRect(bx, by, bw, bh);
+        const rrect = Skia.RRectXY(rect, theme.cornerRadius, theme.cornerRadius);
+
+        // Relleno translúcido
+        paint.setStyle(PaintStyle.Fill);
+        paint.setColor(Skia.Color(palette.fill));
+        canvas.drawRRect(rrect, paint);
+
+        if (theme.useCornerBrackets) {
+          // Borde guía tenue + Esquinas ópticas de enfoque (Corner Brackets) con brillo neón
+          paint.setStyle(PaintStyle.Stroke);
+          paint.setStrokeWidth(1);
+          paint.setColor(Skia.Color(palette.glow));
+          canvas.drawRRect(rrect, paint);
+
+          const cLen = Math.min(theme.cornerBracketLength, bw * 0.32, bh * 0.32);
+          paint.setStrokeWidth(theme.boxStrokeWidth + 0.6);
+          paint.setColor(Skia.Color(palette.stroke));
+          paint.setStrokeCap(StrokeCap.Square);
+
+          // Top-Left
+          canvas.drawLine(bx, by, bx + cLen, by, paint);
+          canvas.drawLine(bx, by, bx, by + cLen, paint);
+          // Top-Right
+          canvas.drawLine(bx + bw - cLen, by, bx + bw, by, paint);
+          canvas.drawLine(bx + bw, by, bx + bw, by + cLen, paint);
+          // Bottom-Left
+          canvas.drawLine(bx, by + bh - cLen, bx, by + bh, paint);
+          canvas.drawLine(bx, by + bh, bx + cLen, by + bh, paint);
+          // Bottom-Right
+          canvas.drawLine(bx + bw - cLen, by + bh, bx + bw, by + bh, paint);
+          canvas.drawLine(bx + bw, by + bh - cLen, bx + bw, by + bh, paint);
+        } else {
+          // Caja continua (Minimalista Nativa o Alto Contraste Industrial)
+          paint.setStyle(PaintStyle.Stroke);
+          paint.setStrokeWidth(theme.boxStrokeWidth);
+          paint.setColor(Skia.Color(palette.stroke));
+          canvas.drawRRect(rrect, paint);
+        }
+
+        // =====================================================================
+        // 3. ETIQUETAS FLOTANTES (CALLOUT PINS / PÍLDORAS FROSTED / INDUSTRIAL)
+        // =====================================================================
+        if (showLabels) {
+          const confPct = Math.round(track.score * 100);
+          const distMeters = estimateObjectDistanceMeters(track.category, bh, height);
+          const labelText = theme.showDistanceEstimate
+            ? \`#\${track.id} \${track.className.toUpperCase()} \${confPct}% • ~\${distMeters.toFixed(1)}m\`
+            : \`\${track.className} \${confPct}%\`;
+
+          const pillW = Math.max(76, labelText.length * 6.4 + 14);
+          const pillH = 20;
+
+          if (theme.showLeaderLinePins) {
+            // Línea guía oblicua estilo visor óptico AR (Callout Pin)
+            const anchorX = bx + Math.min(24, bw * 0.25);
+            const anchorY = by;
+            const elbowX = Math.min(width - pillW - 6, anchorX + 12);
+            const elbowY = Math.max(28, anchorY - 14);
+
+            paint.setStyle(PaintStyle.Stroke);
+            paint.setStrokeWidth(1.3);
+            paint.setColor(Skia.Color(palette.stroke));
+            canvas.drawLine(anchorX, anchorY, elbowX, elbowY, paint);
+
+            const pillRect = Skia.RRectXY(
+              Skia.XYWHRect(elbowX, elbowY - pillH, pillW, pillH),
+              4,
+              4
+            );
+            paint.setStyle(PaintStyle.Fill);
+            paint.setColor(Skia.Color(theme.pillBackground));
+            canvas.drawRRect(pillRect, paint);
+
+            paint.setStyle(PaintStyle.Stroke);
+            paint.setStrokeWidth(1.2);
+            paint.setColor(Skia.Color(palette.stroke));
+            canvas.drawRRect(pillRect, paint);
+
+            if (font) {
+              paint.setStyle(PaintStyle.Fill);
+              paint.setColor(Skia.Color(theme.pillTextColor));
+              canvas.drawText(labelText, elbowX + 7, elbowY - 6, paint, font);
+            }
+          } else {
+            // Píldora compacta directa (Nativo Frosted Glass o Industrial Sólido)
+            const pillX = bx;
+            const pillY = by > pillH + 6 ? by - pillH - 4 : by + 4;
+            const pillRect = Skia.RRectXY(
+              Skia.XYWHRect(pillX, pillY, pillW, pillH),
+              themeId === 'native' ? 10 : 2,
+              themeId === 'native' ? 10 : 2
+            );
+
+            paint.setStyle(PaintStyle.Fill);
+            paint.setColor(
+              Skia.Color(themeId === 'industrial' ? '#090D16' : theme.pillBackground)
+            );
+            canvas.drawRRect(pillRect, paint);
+
+            if (themeId === 'industrial') {
+              paint.setStyle(PaintStyle.Stroke);
+              paint.setStrokeWidth(1.8);
+              paint.setColor(Skia.Color(palette.stroke));
+              canvas.drawRRect(pillRect, paint);
+            }
+
+            if (font) {
+              paint.setStyle(PaintStyle.Fill);
+              paint.setColor(
+                Skia.Color(themeId === 'industrial' ? palette.stroke : theme.pillTextColor)
+              );
+              canvas.drawText(labelText, pillX + 7, pillY + 14, paint, font);
+            }
+          }
+        }
+
+        // =====================================================================
+        // 4. ESQUELETO BIOMECÁNICO 17 KEYPOINTS (ESTABILIZADO CON GIROSCOPIO)
+        // =====================================================================
+        if (showSkeleton && track.keypoints && track.keypoints.length === 17) {
+          paint.setStyle(PaintStyle.Stroke);
+          paint.setStrokeWidth(themeId === 'native' ? 1.6 : 2.3);
+          paint.setStrokeCap(StrokeCap.Round);
+          paint.setColor(Skia.Color(theme.skeletonBoneColor));
+
+          for (let e = 0; e < SKELETON_EDGES.length; e++) {
+            const [aIdx, bIdx] = SKELETON_EDGES[e];
+            const kpA = track.keypoints[aIdx];
+            const kpB = track.keypoints[bIdx];
+
+            if (kpA && kpB && kpA.visibility > 0.5 && kpB.visibility > 0.5) {
+              canvas.drawLine(
+                kpA.x + gyro.offsetX,
+                kpA.y + gyro.offsetY,
+                kpB.x + gyro.offsetX,
+                kpB.y + gyro.offsetY,
+                paint
+              );
+            }
+          }
+
+          paint.setStyle(PaintStyle.Fill);
+          for (let k = 0; k < 17; k++) {
+            const kp = track.keypoints[k];
+            if (kp && kp.visibility > 0.5) {
+              const kx = kp.x + gyro.offsetX;
+              const ky = kp.y + gyro.offsetY;
+              paint.setColor(Skia.Color('#090D16'));
+              canvas.drawCircle(kx, ky, themeId === 'native' ? 3.2 : 4.2, paint);
+              paint.setColor(Skia.Color(theme.skeletonJointColor));
+              canvas.drawCircle(kx, ky, themeId === 'native' ? 2.2 : 3.0, paint);
+            }
+          }
+        }
+      }
+    });
+  }, [
+    tracksShared,
+    gyroOffsetShared,
+    themeIdShared,
+    showSkeletonShared,
+    showLabelsShared,
+    tacticalFont,
+    nativeFont,
+    width,
+    height,
+    lerpFactor,
+  ]);
+
+  return (
+    <Canvas style={StyleSheet.absoluteFill} pointerEvents="none">
+      <Picture picture={arPicture} />
+    </Canvas>
+  );
+};`,
   },
   {
     id: 'skia-overlay',
@@ -1498,11 +2134,11 @@ export function useObjectDetectionProcessor(
     name: 'DetectionOverlayCanvas.tsx',
     language: 'typescript',
     deliverable: 'ui',
-    summary: 'Visor AR superpuesto a 60 FPS sin re-renders de React: usa createPicture + useDerivedValue sobre SharedValue para dibujar RoundedRect por clase, píldoras y esqueleto #22C55E.',
+    summary: 'Visor AR superpuesto a 60 FPS sin re-renders de React: usa createPicture + useDerivedValue sobre SharedValue para renderizar las 80 clases de COCO (personas, vehículos, bicicletas/motos, animales y objetos) con relleno translúcido, píldoras y esqueleto #22C55E.',
     highlights: [
-      'Cero re-renders de React: Skia.PictureRecorder lee directamente SharedValue',
-      'Colores: #38BDF8 (person), #F97316 (car/bus), #10B981 (bicycle)',
-      'Esqueleto articulado #22C55E para keypoints con visibility > 0.5',
+      'Cero re-renders de React: Skia.PictureRecorder lee directamente SharedValue en UI Worklet',
+      'Soporte completo para las 80 clases COCO con paleta por categoría semántica',
+      'Clamping de seguridad en coordenadas y esqueleto articulado #22C55E para keypoints > 0.5',
     ],
     content: `import React, { useMemo } from 'react';
 import { StyleSheet } from 'react-native';
@@ -1516,7 +2152,7 @@ import {
   StrokeCap,
 } from '@shopify/react-native-skia';
 import { SharedValue, useDerivedValue } from 'react-native-reanimated';
-import { TrackedObject } from '../utils/visionPostProcessor';
+import { SemanticCategory, TrackedObject } from '../utils/visionPostProcessor';
 
 const SKELETON_EDGES: ReadonlyArray<[number, number]> = [
   [0, 1], [0, 2], [1, 3], [2, 4],
@@ -1525,11 +2161,12 @@ const SKELETON_EDGES: ReadonlyArray<[number, number]> = [
   [11, 13], [13, 15], [12, 14], [14, 16],
 ];
 
-const CLASS_HEX: Record<string, string> = {
-  person: '#38BDF8',
-  car: '#F97316',
-  bus: '#F97316',
-  bicycle: '#10B981',
+const CATEGORY_PALETTE: Record<SemanticCategory, { stroke: string; fill: string }> = {
+  person:  { stroke: '#38BDF8', fill: 'rgba(56, 189, 248, 0.14)' },
+  vehicle: { stroke: '#F97316', fill: 'rgba(249, 115, 22, 0.14)' },
+  bicycle: { stroke: '#10B981', fill: 'rgba(16, 185, 129, 0.14)' },
+  animal:  { stroke: '#A855F7', fill: 'rgba(168, 85, 247, 0.16)' },
+  object:  { stroke: '#EAB308', fill: 'rgba(234, 179, 8, 0.14)' },
 };
 
 interface DetectionOverlayCanvasProps {
@@ -1558,6 +2195,12 @@ export const DetectionOverlayCanvas: React.FC<DetectionOverlayCanvasProps> = ({
     const tracks = tracksShared.value;
 
     return createPicture((canvas) => {
+      if (width <= 0 || height <= 0) return;
+
+      const boxFillPaint = Skia.Paint();
+      boxFillPaint.setStyle(PaintStyle.Fill);
+      boxFillPaint.setAntiAlias(true);
+
       const strokePaint = Skia.Paint();
       strokePaint.setStyle(PaintStyle.Stroke);
       strokePaint.setStrokeWidth(2);
@@ -1565,7 +2208,7 @@ export const DetectionOverlayCanvas: React.FC<DetectionOverlayCanvasProps> = ({
 
       const pillBgPaint = Skia.Paint();
       pillBgPaint.setStyle(PaintStyle.Fill);
-      pillBgPaint.setColor(Skia.Color('rgba(11, 15, 23, 0.80)'));
+      pillBgPaint.setColor(Skia.Color('rgba(11, 15, 23, 0.84)'));
       pillBgPaint.setAntiAlias(true);
 
       const textPaint = Skia.Paint();
@@ -1585,18 +2228,37 @@ export const DetectionOverlayCanvas: React.FC<DetectionOverlayCanvasProps> = ({
 
       for (let i = 0; i < tracks.length; i++) {
         const tr = tracks[i];
-        if (tr.lostFrames > 0) continue;
+        if (!tr || tr.lostFrames > 0) continue;
 
-        const hex = CLASS_HEX[tr.className] ?? '#38BDF8';
-        const color = Skia.Color(hex);
-        const { x, y, width: bw, height: bh } = tr.screenBox;
+        const palette = CATEGORY_PALETTE[tr.category] ?? CATEGORY_PALETTE.object;
+        const strokeColor = Skia.Color(palette.stroke);
+        const fillColor = Skia.Color(palette.fill);
 
-        // 1. Bounding Box con esquinas redondeadas
-        strokePaint.setColor(color);
+        const rawX = tr.screenBox.x;
+        const rawY = tr.screenBox.y;
+        const rawW = tr.screenBox.width;
+        const rawH = tr.screenBox.height;
+
+        // Ignora cajas degeneradas o fuera de rango numérico
+        if (!Number.isFinite(rawX) || !Number.isFinite(rawY) || rawW < 2 || rawH < 2) {
+          continue;
+        }
+
+        const x = Math.max(0, Math.min(width - 4, rawX));
+        const y = Math.max(0, Math.min(height - 4, rawY));
+        const bw = Math.max(4, Math.min(width - x, rawW));
+        const bh = Math.max(4, Math.min(height - y, rawH));
+
+        // 1. Bounding Box con relleno translúcido y borde redondeado
         const rrect = Skia.RRectXY(Skia.XYWHRect(x, y, bw, bh), 8, 8);
+        boxFillPaint.setColor(fillColor);
+        canvas.drawRRect(rrect, boxFillPaint);
+
+        strokePaint.setColor(strokeColor);
+        strokePaint.setStrokeWidth(2);
         canvas.drawRRect(rrect, strokePaint);
 
-        // 2. Píldora superior de telemetría (ej. person #43 0.92)
+        // 2. Píldora superior de telemetría (ej. dog #12 0.89 / person #1 0.94)
         const label = \`\${tr.className} #\${tr.trackId} \${tr.confidence.toFixed(2)}\`;
         const pillW = label.length * 6.5 + 14;
         const pillH = 18;
@@ -1608,13 +2270,12 @@ export const DetectionOverlayCanvas: React.FC<DetectionOverlayCanvasProps> = ({
 
         strokePaint.setStrokeWidth(1);
         canvas.drawRRect(pillRRect, strokePaint);
-        strokePaint.setStrokeWidth(2);
 
-        textPaint.setColor(color);
+        textPaint.setColor(strokeColor);
         canvas.drawText(label, pillX + 7, pillY + 12.5, textPaint, labelFont);
 
         // 3. Esqueleto articulado verde neón (#22C55E) para keypoints visibles (> 0.5)
-        if (tr.classId === 0 && tr.hasPose) {
+        if (tr.classId === 0 && tr.hasPose && tr.keypoints && tr.keypoints.length >= 17) {
           for (let e = 0; e < SKELETON_EDGES.length; e++) {
             const [idxA, idxB] = SKELETON_EDGES[e];
             const kpA = tr.keypoints[idxA];
@@ -1625,7 +2286,7 @@ export const DetectionOverlayCanvas: React.FC<DetectionOverlayCanvasProps> = ({
 
           for (let k = 0; k < tr.keypoints.length; k++) {
             const kp = tr.keypoints[k];
-            if (kp.visibility <= 0.5) continue;
+            if (!kp || kp.visibility <= 0.5) continue;
             canvas.drawCircle(kp.x, kp.y, 3, jointPaint);
           }
         }
@@ -2260,7 +2921,7 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                         {tr.confidence.toFixed(2)}
                       </Text>
                       <Text style={[styles.tdMonoMuted, { flex: 1, textAlign: 'right' }]}>
-                        [{Math.round(tr.x)},{Math.round(tr.y)},{Math.round(tr.w)},{Math.round(tr.h)}]
+                        [{Math.round(tr.screenBox.x)},{Math.round(tr.screenBox.y)},{Math.round(tr.screenBox.width)},{Math.round(tr.screenBox.height)}]
                       </Text>
                       <Text style={[styles.tdKps, { width: 44, textAlign: 'right' }]}>{kpsText}</Text>
                       <Text style={[styles.tdMonoMuted, { width: 44, textAlign: 'right' }]}>
@@ -2503,10 +3164,10 @@ export const VisionEdgeDashboard: React.FC = () => {
       const { tracks, timings } = visionStateShared.value;
       const visible = tracks.filter((t) => t.lostFrames === 0);
 
-      const persons = visible.filter((t) => t.classId === 0).length;
-      const vehicles = visible.filter((t) => t.classId === 2 || t.classId === 5).length;
-      const bicycles = visible.filter((t) => t.classId === 1).length;
-      const total = persons + vehicles + bicycles;
+      const persons = visible.filter((t) => t.category === 'person').length;
+      const vehicles = visible.filter((t) => t.category === 'vehicle').length;
+      const bicycles = visible.filter((t) => t.category === 'bicycle').length;
+      const total = visible.length;
       const density = total < 3 ? 'Low' : total <= 7 ? 'Moderate' : 'High';
 
       const prev = prevCountsRef.current;
@@ -2548,6 +3209,7 @@ export const VisionEdgeDashboard: React.FC = () => {
     poseModel,
     visionStateShared,
     confShared,
+    iouShared,
     isFrontShared,
     visorSize
   );

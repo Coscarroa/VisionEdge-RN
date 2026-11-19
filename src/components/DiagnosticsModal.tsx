@@ -1,12 +1,25 @@
 import React, { useState } from 'react';
-import { X, Pause, Play, RotateCcw, Code2, Activity } from 'lucide-react';
 import {
+  X,
+  Pause,
+  Play,
+  RotateCcw,
+  Code2,
+  Activity,
+  Compass,
+  Sparkles,
+} from 'lucide-react';
+import {
+  ARVisualTheme,
   CLASS_COLOR_MAP,
+  GyroStabilizationTelemetry,
   PipelineMetrics,
   PipelineSettings,
   ThermalControlMode,
+  TimeSeriesPoint,
   TrackedObject,
 } from '../engine/cvTypes';
+import { AR_THEMES, AR_THEME_ORDER } from '../config/ARThemeConfig';
 import { CodeArchitectureExplorer } from './CodeArchitectureExplorer';
 import { DeliverableCategory, RN_ARCHITECTURE_FILES } from '../data/rnArchitectureFiles';
 
@@ -15,6 +28,9 @@ interface DiagnosticsModalProps {
   settings: PipelineSettings;
   metrics: PipelineMetrics;
   tracks: TrackedObject[];
+  timeSeries: TimeSeriesPoint[];
+  latencyHistory: number[];
+  gyroTelemetry: GyroStabilizationTelemetry;
   onUpdate: (patch: Partial<PipelineSettings>) => void;
   onResetHeatmap: () => void;
   onClose: () => void;
@@ -25,15 +41,17 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
   settings,
   metrics,
   tracks,
+  timeSeries,
+  latencyHistory,
+  gyroTelemetry,
   onUpdate,
   onResetHeatmap,
   onClose,
 }) => {
   const [showCodeExplorer, setShowCodeExplorer] = useState(false);
-  const [selectedFileId, setSelectedFileId] = useState<string>('diagnostics-modal');
+  const [selectedFileId, setSelectedFileId] = useState<string>('ar-overlay-canvas');
   const [categoryFilter, setCategoryFilter] = useState<DeliverableCategory | 'all'>('all');
 
-  // Evita trabajo de render y cálculos mientras el modal esté cerrado
   if (!visible) return null;
 
   const thermalOptions: Array<{ id: ThermalControlMode; label: string }> = [
@@ -70,7 +88,7 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
       color: '#10B981',
     },
     {
-      name: '6. React Native Skia Render',
+      name: '6. React Native Skia AR + Gyro LERP',
       ms: metrics.timings.renderMs,
       color: '#A78BFA',
     },
@@ -99,8 +117,8 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
     >
       <div
         className={`w-full ${
-          showCodeExplorer ? 'max-w-5xl' : 'max-w-xl'
-        } max-h-[85dvh] bg-[#0F172A] border-t border-x sm:border border-[#1E293B] rounded-t-[24px] sm:rounded-[24px] shadow-2xl flex flex-col overflow-hidden`}
+          showCodeExplorer ? 'max-w-5xl' : 'max-w-2xl'
+        } max-h-[88dvh] bg-[#0F172A]/95 backdrop-blur-xl border-t border-x sm:border border-[#1E293B] rounded-t-[24px] sm:rounded-[24px] shadow-2xl flex flex-col overflow-hidden`}
       >
         {/* Drag Handle + Header */}
         <div className="px-5 pt-2.5 pb-3 border-b border-[#1E293B] flex flex-col gap-2.5 shrink-0">
@@ -109,10 +127,10 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
               <h2 id="diagnostics-modal-title" className="text-[15px] font-semibold text-slate-100 truncate">
-                Ajustes y Telemetría Avanzada
+                Ajustes AR, Estabilización IMU y Telemetría
               </h2>
               <p className="text-[11px] text-slate-400 truncate">
-                Control térmico, calibración YOLO/NMS, latencia EMA y ByteTrack
+                Temas AR en vivo, Giroscopio 60Hz, Gráfica 20s, Latencia EMA y ByteTrack
               </p>
             </div>
 
@@ -153,27 +171,167 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
             />
           ) : (
             <>
-              {/* Sección 1: Controles Rápidos y Gobernanza Térmica */}
+              {/* Sección 1: Selector de Estilo Visual AR (ARThemeConfig.ts) & Giroscopio 60Hz */}
               <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between gap-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                    1. Controles Rápidos y Gobernanza Térmica
-                  </h3>
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-sky-400" />
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                      1. Estilo Visual AR & Estabilización Predictiva IMU (60Hz)
+                    </h3>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => handleOpenCodeFile('diagnostics-modal')}
+                    onClick={() => handleOpenCodeFile('ar-theme-config')}
                     className="text-[11px] font-mono text-sky-400 hover:underline cursor-pointer"
                   >
-                    Ver RN
+                    ARThemeConfig.ts
                   </button>
                 </div>
 
-                {/* Fila principal de acciones: Pausar/Reanudar + Reiniciar Heatmap */}
+                {/* 3 Tarjetas de Tema Visual AR */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  {AR_THEME_ORDER.map((themeKey: ARVisualTheme) => {
+                    const spec = AR_THEMES[themeKey];
+                    const isSelected = settings.arTheme === themeKey;
+                    return (
+                      <button
+                        key={themeKey}
+                        type="button"
+                        onClick={() => onUpdate({ arTheme: themeKey })}
+                        className={`p-3 rounded-xl border text-left transition-all cursor-pointer flex flex-col gap-1 ${
+                          isSelected
+                            ? 'bg-sky-500/15 border-sky-400 text-slate-100 shadow-md'
+                            : 'bg-[#0B0F17] border-[#1E293B] text-slate-300 hover:bg-slate-800/70'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold">{spec.shortLabel}</span>
+                          <span
+                            className="w-2.5 h-2.5 rounded-full"
+                            style={{
+                              backgroundColor:
+                                themeKey === 'tactical'
+                                  ? '#38BDF8'
+                                  : themeKey === 'industrial'
+                                  ? '#FACC15'
+                                  : '#FFFFFF',
+                            }}
+                          />
+                        </div>
+                        <span className="text-[10.5px] text-slate-400 line-clamp-2 leading-snug">
+                          {spec.name}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Estado del Giroscopio Predictivo (useGyroARStabilization.ts) */}
+                <div className="p-3 rounded-xl bg-[#0B0F17] border border-[#1E293B] flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    <Compass
+                      className={`w-4 h-4 ${
+                        settings.enableGyro ? 'text-emerald-400' : 'text-slate-500'
+                      }`}
+                    />
+                    <div>
+                      <div className="text-xs font-semibold text-slate-200">
+                        Compensación Inter-Frame con Giroscopio (Zero-Lag LERP)
+                      </div>
+                      <div className="text-[10.5px] font-mono text-slate-400 tabular-nums">
+                        ω=({gyroTelemetry.omegaX.toFixed(2)}, {gyroTelemetry.omegaY.toFixed(2)} rad/s) •
+                        Offset=({gyroTelemetry.offsetX.toFixed(1)}px, {gyroTelemetry.offsetY.toFixed(1)}px)
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleOpenCodeFile('gyro-ar-stabilization')}
+                      className="text-[10.5px] font-mono text-sky-400 hover:underline cursor-pointer"
+                    >
+                      Ver Hook
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onUpdate({ enableGyro: !settings.enableGyro })}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold border cursor-pointer transition-colors ${
+                        settings.enableGyro
+                          ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {settings.enableGyro ? 'Gyro 60Hz: ON' : 'Gyro: OFF'}
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              {/* Sección 2: Gráfica de Seguimiento 20s & Onda de Velocidad (Movidas al Bottom Sheet) */}
+              <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                      2. Historial de Seguimiento (20s) & Velocidad de Inferencia
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Series temporales desacopladas del visor AR principal
+                    </p>
+                  </div>
+                  <span className="font-mono text-xs font-bold text-sky-400 tabular-nums">
+                    {metrics.realFps.toFixed(1)} FPS ({metrics.timings.totalMs.toFixed(1)} ms)
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Gráfica de Seguimiento de Objetos (20s) */}
+                  <div className="p-3 rounded-xl bg-[#0B0F17] border border-[#1E293B] flex flex-col gap-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-300">Object Tracking (20s)</span>
+                      <div className="flex items-center gap-2 font-mono text-[10px]">
+                        <span className="text-[#38BDF8]">● Per</span>
+                        <span className="text-[#F97316]">● Veh</span>
+                        <span className="text-[#10B981]">● Bici</span>
+                      </div>
+                    </div>
+                    <TrackingSvgChart data={timeSeries} />
+                  </div>
+
+                  {/* Onda de Latencia por Frame (ms) */}
+                  <div className="p-3 rounded-xl bg-[#0B0F17] border border-[#1E293B] flex flex-col gap-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-300">Processing Speed Wave</span>
+                      <span className="font-mono text-[10px] text-emerald-400 tabular-nums">
+                        Avg 30f: {metrics.rollingAvgMs.toFixed(1)} ms
+                      </span>
+                    </div>
+                    <LatencyWaveSvg values={latencyHistory} />
+                  </div>
+                </div>
+              </section>
+
+              {/* Sección 3: Controles Rápidos y Gobernanza Térmica */}
+              <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                    3. Controles del Pipeline y Gobernanza Térmica
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('app-tsx-unified')}
+                    className="text-[11px] font-mono text-sky-400 hover:underline cursor-pointer"
+                  >
+                    Ver App.tsx
+                  </button>
+                </div>
+
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
                     type="button"
                     onClick={() => onUpdate({ isRunning: !settings.isRunning })}
-                    className="min-h-[42px] px-3 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
+                    className="min-h-[40px] px-3 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
                   >
                     {settings.isRunning ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
                     <span>{settings.isRunning ? 'Pausar Pipeline' : 'Reanudar Pipeline'}</span>
@@ -182,14 +340,13 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                   <button
                     type="button"
                     onClick={onResetHeatmap}
-                    className="min-h-[42px] px-3 rounded-xl bg-[#1E293B]/70 hover:bg-slate-700 border border-[#334155] text-slate-100 text-xs font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
+                    className="min-h-[40px] px-3 rounded-xl bg-[#1E293B]/70 hover:bg-slate-700 border border-[#334155] text-slate-100 text-xs font-medium flex items-center justify-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Reiniciar Heatmap</span>
+                    <span>Reiniciar Radar/Heatmap</span>
                   </button>
                 </div>
 
-                {/* Modificadores secundarios de escenario y aceleración */}
                 <div className="grid grid-cols-3 gap-2">
                   <button
                     type="button"
@@ -232,99 +389,78 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                   </button>
                 </div>
 
-                {/* Selector segmentado de modo térmico */}
-                <div className="flex flex-col gap-1.5">
-                  <div className="grid grid-cols-4 gap-1 bg-[#0B0F17] p-1 rounded-xl border border-[#1E293B]">
-                    {thermalOptions.map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => onUpdate({ thermalControlMode: opt.id })}
-                        className={`min-h-[34px] px-1 rounded-lg text-[10.5px] font-medium transition-colors cursor-pointer truncate ${
-                          settings.thermalControlMode === opt.id
-                            ? 'bg-emerald-500 text-slate-950 font-semibold'
-                            : 'text-slate-400 hover:text-slate-100'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
+                {/* Selector segmentado de modo térmico + Sliders Conf/IoU */}
+                <div className="grid grid-cols-4 gap-1 bg-[#0B0F17] p-1 rounded-xl border border-[#1E293B]">
+                  {thermalOptions.map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => onUpdate({ thermalControlMode: opt.id })}
+                      className={`min-h-[32px] px-1 rounded-lg text-[10.5px] font-medium transition-colors cursor-pointer truncate ${
+                        settings.thermalControlMode === opt.id
+                          ? 'bg-emerald-500 text-slate-950 font-semibold'
+                          : 'text-slate-400 hover:text-slate-100'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <label htmlFor="diag-conf-slider" className="font-medium text-slate-300">
+                        Confidence Threshold
+                      </label>
+                      <span className="font-mono text-sky-400 font-semibold tabular-nums">
+                        {settings.confidenceThreshold.toFixed(2)}
+                      </span>
+                    </div>
+                    <input
+                      id="diag-conf-slider"
+                      type="range"
+                      min={0.1}
+                      max={0.9}
+                      step={0.01}
+                      value={settings.confidenceThreshold}
+                      onChange={(e) => onUpdate({ confidenceThreshold: parseFloat(e.target.value) })}
+                      className="w-full accent-sky-400 cursor-pointer"
+                    />
                   </div>
-                  <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 tabular-nums px-0.5">
-                    <span>
-                      Activo: <strong className="text-slate-200">{metrics.thermalMode}</strong>
-                    </span>
-                    <span>Avg 30f: {metrics.rollingAvgMs.toFixed(1)} ms</span>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <label htmlFor="diag-iou-slider" className="font-medium text-slate-300">
+                        NMS IoU Threshold
+                      </label>
+                      <span className="font-mono text-sky-400 font-semibold tabular-nums">
+                        {settings.nmsIouThreshold.toFixed(2)}
+                      </span>
+                    </div>
+                    <input
+                      id="diag-iou-slider"
+                      type="range"
+                      min={0.1}
+                      max={0.9}
+                      step={0.01}
+                      value={settings.nmsIouThreshold}
+                      onChange={(e) => onUpdate({ nmsIouThreshold: parseFloat(e.target.value) })}
+                      className="w-full accent-sky-400 cursor-pointer"
+                    />
                   </div>
                 </div>
               </section>
 
-              {/* Sección 2: Sliders de Calibración en Tiempo Real */}
-              <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                  2. Sliders de Calibración en Tiempo Real
-                </h3>
-
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <label htmlFor="diag-conf-slider" className="font-medium text-slate-200">
-                      Confidence Threshold
-                    </label>
-                    <span className="font-mono text-sky-400 font-semibold tabular-nums">
-                      {settings.confidenceThreshold.toFixed(2)}
-                    </span>
-                  </div>
-                  <input
-                    id="diag-conf-slider"
-                    type="range"
-                    min={0.10}
-                    max={0.90}
-                    step={0.01}
-                    value={settings.confidenceThreshold}
-                    onChange={(e) => onUpdate({ confidenceThreshold: parseFloat(e.target.value) })}
-                    className="w-full accent-sky-400 cursor-pointer"
-                  />
-                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                    <span>0.10</span>
-                    <span>0.90</span>
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <label htmlFor="diag-iou-slider" className="font-medium text-slate-200">
-                      NMS IoU Threshold
-                    </label>
-                    <span className="font-mono text-sky-400 font-semibold tabular-nums">
-                      {settings.nmsIouThreshold.toFixed(2)}
-                    </span>
-                  </div>
-                  <input
-                    id="diag-iou-slider"
-                    type="range"
-                    min={0.10}
-                    max={0.90}
-                    step={0.01}
-                    value={settings.nmsIouThreshold}
-                    onChange={(e) => onUpdate({ nmsIouThreshold: parseFloat(e.target.value) })}
-                    className="w-full accent-sky-400 cursor-pointer"
-                  />
-                  <div className="flex justify-between text-[10px] font-mono text-slate-500">
-                    <span>0.10</span>
-                    <span>0.90</span>
-                  </div>
-                </div>
-              </section>
-
-              {/* Sección 3: Panel de Latencia por Etapa (EMA) */}
+              {/* Sección 4: Desglose de Latencia por Etapa (EMA) */}
               <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-start justify-between gap-3">
                   <div>
                     <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                      3. Panel de Latencia por Etapa (EMA)
+                      4. Desglose de Latencia por Etapa (EMA)
                     </h3>
                     <p className="text-[11px] text-slate-400 mt-0.5">
-                      Instrumentación JSI Worklet en tiempo real
+                      Instrumentación JSI Worklet + Skia AR Overlay
                     </p>
                   </div>
                   <div className="text-right font-mono tabular-nums shrink-0">
@@ -337,7 +473,7 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-2.5">
+                <div className="flex flex-col gap-2">
                   {stageRows.map((stage) => (
                     <div key={stage.name} className="flex flex-col gap-1">
                       <div className="flex items-center justify-between text-xs gap-2">
@@ -360,11 +496,11 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                 </div>
               </section>
 
-              {/* Sección 4: Tabla de Objetos Rastreados (ByteTrack + NMS) */}
+              {/* Sección 5: Tabla de Objetos Rastreados (ByteTrack + NMS) */}
               <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                    4. Tabla de Objetos Rastreados (ByteTrack + NMS)
+                    5. Tabla de Objetos Rastreados (ByteTrack + LERP)
                   </h3>
                   <span className="font-mono text-[11px] px-2 py-0.5 rounded-md bg-[#0B0F17] border border-[#1E293B] text-sky-400 tabular-nums shrink-0">
                     {tracks.length} activos
@@ -425,10 +561,147 @@ export const DiagnosticsModal: React.FC<DiagnosticsModalProps> = ({
                   </div>
                 )}
               </section>
+
+              {/* Sección 6: Acceso Directo a los Archivos de Arquitectura AR & Giroscopio */}
+              <section className="bg-[#121826] border border-[#1E293B] rounded-2xl p-4 flex flex-col gap-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                      6. Arquitectura React Native AR + Giroscopio + Skia
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Inspecciona el código completo listo para producción
+                    </p>
+                  </div>
+                  <span className="font-mono text-[10.5px] px-2 py-0.5 rounded-md bg-emerald-500/15 border border-emerald-400/35 text-emerald-300 shrink-0">
+                    AR HUD + 60Hz IMU
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('gyro-ar-stabilization')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-emerald-400 truncate">
+                      useGyroARStabilization.ts
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      expo-sensors 60Hz + SharedValue
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('ar-overlay-canvas')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-sky-400 truncate">
+                      AROverlayCanvas.tsx
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      3 Temas AR + LERP + Gyro Offset
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('ar-theme-config')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-yellow-400 truncate">
+                      ARThemeConfig.ts
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      Táctico / Nativo / Industrial
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleOpenCodeFile('app-tsx-unified')}
+                    className="px-3 py-2 rounded-xl bg-[#0B0F17] hover:bg-slate-900 border border-[#1E293B] text-left transition-colors cursor-pointer"
+                  >
+                    <div className="text-[11px] font-mono font-semibold text-purple-400 truncate">
+                      App.tsx
+                    </div>
+                    <div className="text-[10px] text-slate-400 truncate">
+                      Full-Screen AR + Glass HUD
+                    </div>
+                  </button>
+                </div>
+              </section>
             </>
           )}
         </div>
       </div>
     </div>
+  );
+};
+
+const TrackingSvgChart: React.FC<{ data: TimeSeriesPoint[] }> = ({ data }) => {
+  const w = 260;
+  const h = 68;
+  const maxVal = Math.max(
+    6,
+    ...data.map((d) => Math.max(d.persons, d.vehicles, d.bicycles))
+  );
+
+  const buildPolyline = (getter: (pt: TimeSeriesPoint) => number) =>
+    data
+      .map((pt, i) => {
+        const x = (i / Math.max(1, data.length - 1)) * (w - 8) + 4;
+        const y = h - 6 - (getter(pt) / maxVal) * (h - 14);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-[68px] overflow-visible">
+      <line x1="0" y1={h - 6} x2={w} y2={h - 6} stroke="#1E293B" strokeWidth="1" />
+      <line x1="0" y1={h * 0.5} x2={w} y2={h * 0.5} stroke="#1E293B" strokeDasharray="3 3" strokeWidth="1" />
+      <polyline
+        fill="none"
+        stroke="#38BDF8"
+        strokeWidth="2"
+        points={buildPolyline((d) => d.persons)}
+      />
+      <polyline
+        fill="none"
+        stroke="#F97316"
+        strokeWidth="1.8"
+        points={buildPolyline((d) => d.vehicles)}
+      />
+      <polyline
+        fill="none"
+        stroke="#10B981"
+        strokeWidth="1.6"
+        points={buildPolyline((d) => d.bicycles)}
+      />
+    </svg>
+  );
+};
+
+const LatencyWaveSvg: React.FC<{ values: number[] }> = ({ values }) => {
+  const w = 260;
+  const h = 68;
+  const maxMs = Math.max(45, ...values);
+  const minMs = Math.min(12, ...values);
+
+  const pts = values
+    .map((v, i) => {
+      const x = (i / Math.max(1, values.length - 1)) * (w - 8) + 4;
+      const norm = (v - minMs) / Math.max(1, maxMs - minMs);
+      const y = h - 6 - norm * (h - 14);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-[68px] overflow-visible">
+      <line x1="0" y1={h - 6} x2={w} y2={h - 6} stroke="#1E293B" strokeWidth="1" />
+      <polyline fill="none" stroke="#22C55E" strokeWidth="2" points={pts} />
+    </svg>
   );
 };

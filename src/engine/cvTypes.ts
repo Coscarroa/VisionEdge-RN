@@ -1,6 +1,26 @@
-export type TargetClass = 'person' | 'car' | 'bus' | 'bicycle';
+export type TargetClass =
+  | 'person'
+  | 'car'
+  | 'bus'
+  | 'truck'
+  | 'bicycle'
+  | 'motorcycle'
+  | 'dog'
+  | 'backpack';
 
-export type CategoryBucket = 'persons' | 'vehicles' | 'bicycles';
+export type CategoryBucket = 'persons' | 'vehicles' | 'bicycles' | 'animalsOther';
+
+export type ARVisualTheme = 'tactical' | 'native' | 'industrial';
+
+export interface GyroStabilizationTelemetry {
+  omegaX: number; // rad/s Pitch
+  omegaY: number; // rad/s Yaw
+  omegaZ: number; // rad/s Roll
+  offsetX: number; // px inter-frame compensation X
+  offsetY: number; // px inter-frame compensation Y
+  activeHz: number;
+  lastResetAgoMs: number;
+}
 
 export type CameraSourceMode = 'rear-crosswalk' | 'bike-boulevard' | 'webcam';
 
@@ -61,9 +81,11 @@ export interface CategoryStats {
   persons: number;
   vehicles: number;
   bicycles: number;
+  animalsOther: number;
   deltaPersons: number;
   deltaVehicles: number;
   deltaBicycles: number;
+  deltaAnimalsOther: number;
 }
 
 export interface PipelineStageTimings {
@@ -111,7 +133,9 @@ export interface PipelineSettings {
   cameraMode: CameraSourceMode;
   delegate: HardwareDelegate;
   thermalControlMode: ThermalControlMode;
+  arTheme: ARVisualTheme;
   enablePose: boolean;
+  enableGyro: boolean;
   crowdBoost: boolean;
   isRunning: boolean;
 }
@@ -150,5 +174,9 @@ export const CLASS_COLOR_MAP: Record<TargetClass, { stroke: string; fill: string
   person: { stroke: '#38BDF8', fill: 'rgba(56, 189, 248, 0.14)', label: 'person' },
   car: { stroke: '#F97316', fill: 'rgba(249, 115, 22, 0.14)', label: 'car' },
   bus: { stroke: '#F97316', fill: 'rgba(249, 115, 22, 0.14)', label: 'bus' },
+  truck: { stroke: '#F97316', fill: 'rgba(249, 115, 22, 0.14)', label: 'truck' },
   bicycle: { stroke: '#10B981', fill: 'rgba(16, 185, 129, 0.14)', label: 'bicycle' },
+  motorcycle: { stroke: '#10B981', fill: 'rgba(16, 185, 129, 0.14)', label: 'motorcycle' },
+  dog: { stroke: '#A855F7', fill: 'rgba(168, 85, 247, 0.16)', label: 'dog' },
+  backpack: { stroke: '#EAB308', fill: 'rgba(234, 179, 8, 0.14)', label: 'backpack' },
 };

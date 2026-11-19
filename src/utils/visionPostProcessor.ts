@@ -4,12 +4,109 @@
  *
  * Pure TypeScript with zero heavy runtime dependencies. All hot-path buffers are
  * preallocated once at module/instance initialization to avoid Garbage Collection pauses.
+ *
+ * Incluye correcciones de auditoría TFLite:
+ *  1. Normalización garantizada [0.0 .. 1.0] en Float32Array (corrige uint8 / float32 0..255).
+ *  2. Detección automática de layout transpuesto [1, 84, 8400] vs no transpuesto [1, 8400, 84].
+ *  3. Detección automática de escala de coordenadas [0..1] normalizadas vs [0..640] píxeles (w <= 1.5).
+ *  4. Mapeo completo de las 80 clases de COCO (personas, vehículos, animales y objetos cotidianos).
+ *  5. Prevención de doble activación Sigmoid sobre probabilidades ya activadas en el grafo TFLite.
+ *  6. Inspector Smoke Test zero-alloc para telemetría de maxScore y coordenadas crudas [cx, cy, w, h].
  */
 
-export type UrbanClassId = 0 | 1 | 2 | 5;
-export type UrbanClassName = 'person' | 'bicycle' | 'car' | 'bus';
+export type CocoClassId = number; // 0..79 (80 clases oficiales de COCO)
+export type SemanticCategory = 'person' | 'vehicle' | 'bicycle' | 'animal' | 'object';
 export type CategoryKey = 'persons' | 'vehicles' | 'bicycles';
 export type SensorOrientation = 0 | 90 | 180 | 270;
+export type TensorOutputLayout = 'channels-first' | 'anchors-first';
+
+/**
+ * Mapeo completo oficial de las 80 clases de MS-COCO (índices 0 a 79).
+ */
+export const COCO_CLASS_NAMES: readonly string[] = [
+  'person',         // 0
+  'bicycle',        // 1
+  'car',            // 2
+  'motorcycle',     // 3
+  'airplane',       // 4
+  'bus',            // 5
+  'train',          // 6
+  'truck',          // 7
+  'boat',           // 8
+  'traffic light',  // 9
+  'fire hydrant',   // 10
+  'stop sign',      // 11
+  'parking meter',  // 12
+  'bench',          // 13
+  'bird',           // 14
+  'cat',            // 15
+  'dog',            // 16
+  'horse',          // 17
+  'sheep',          // 18
+  'cow',            // 19
+  'elephant',       // 20
+  'bear',           // 21
+  'zebra',          // 22
+  'giraffe',        // 23
+  'backpack',       // 24
+  'umbrella',       // 25
+  'handbag',        // 26
+  'tie',            // 27
+  'suitcase',       // 28
+  'frisbee',        // 29
+  'skis',           // 30
+  'snowboard',      // 31
+  'sports ball',    // 32
+  'kite',           // 33
+  'baseball bat',   // 34
+  'baseball glove', // 35
+  'skateboard',     // 36
+  'surfboard',      // 37
+  'tennis racket',  // 38
+  'bottle',         // 39
+  'wine glass',     // 40
+  'cup',            // 41
+  'fork',           // 42
+  'knife',          // 43
+  'spoon',          // 44
+  'bowl',           // 45
+  'banana',         // 46
+  'apple',          // 47
+  'sandwich',       // 48
+  'orange',         // 49
+  'broccoli',       // 50
+  'carrot',         // 51
+  'hot dog',        // 52
+  'pizza',          // 53
+  'donut',          // 54
+  'cake',           // 55
+  'chair',          // 56
+  'couch',          // 57
+  'potted plant',   // 58
+  'bed',            // 59
+  'dining table',   // 60
+  'toilet',         // 61
+  'tv',             // 62
+  'laptop',         // 63
+  'mouse',          // 64
+  'remote',         // 65
+  'keyboard',       // 66
+  'cell phone',     // 67
+  'microwave',      // 68
+  'oven',           // 69
+  'toaster',        // 70
+  'sink',           // 71
+  'refrigerator',   // 72
+  'book',           // 73
+  'clock',          // 74
+  'vase',           // 75
+  'scissors',       // 76
+  'teddy bear',     // 77
+  'hair drier',     // 78
+  'toothbrush',     // 79
+] as const;
+
+export type CocoClassName = (typeof COCO_CLASS_NAMES)[number];
 
 export interface ScreenRect {
   x: number;
@@ -25,26 +122,28 @@ export interface PoseKeypoint {
 }
 
 export interface YoloProposal {
-  classId: UrbanClassId;
-  className: UrbanClassName;
+  classId: number;
+  className: string;
+  category: SemanticCategory;
   confidence: number;
-  /** Normalized center X in 640x640 letterboxed tensor space [0..1] */
+  /** Coordenada X central normalizada en el espacio del tensor [0.0 .. 1.0] */
   cx: number;
-  /** Normalized center Y in 640x640 letterboxed tensor space [0..1] */
+  /** Coordenada Y central normalizada en el espacio del tensor [0.0 .. 1.0] */
   cy: number;
-  /** Normalized width in 640x640 letterboxed tensor space [0..1] */
+  /** Ancho normalizado en el espacio del tensor [0.0 .. 1.0] */
   w: number;
-  /** Normalized height in 640x640 letterboxed tensor space [0..1] */
+  /** Alto normalizado en el espacio del tensor [0.0 .. 1.0] */
   h: number;
-  /** 17 COCO keypoints (populated for person pose detections) */
+  /** 17 keypoints COCO (poblados para detecciones de personas con pose) */
   keypoints: PoseKeypoint[];
   hasPose: boolean;
 }
 
 export interface TrackedObject {
   trackId: number;
-  classId: UrbanClassId;
-  className: UrbanClassName;
+  classId: number;
+  className: string;
+  category: SemanticCategory;
   confidence: number;
   screenBox: ScreenRect;
   keypoints: PoseKeypoint[];
@@ -59,6 +158,8 @@ export interface CategoryDeltaSnapshot {
   persons: number;
   vehicles: number;
   bicycles: number;
+  animals: number;
+  objects: number;
   deltaPersons: number;
   deltaVehicles: number;
   deltaBicycles: number;
@@ -72,38 +173,169 @@ export interface ProjectionParams {
   tensorSize?: number; // Default 640
   orientation?: SensorOrientation; // Default 0
   resizeMode?: 'cover' | 'contain'; // Default 'cover'
+  /**
+   * 'stretch': vision-camera-resize-plugin redimensiona directo a 640x640 sin bandas negras.
+   * 'letterbox': el preprocesador inserta bandas de padding manteniendo aspect ratio.
+   */
+  inputPaddingMode?: 'stretch' | 'letterbox'; // Default 'stretch'
   isFrontCamera?: boolean; // Default false
 }
 
-const NUM_ANCHORS = 8400;
+export interface TensorSmokeDiagnostic {
+  layout: TensorOutputLayout;
+  numAnchors: number;
+  numChannels: number;
+  numClasses: number;
+  maxScore: number;
+  bestClassId: number;
+  bestClassName: string;
+  bestAnchorIndex: number;
+  rawCx: number;
+  rawCy: number;
+  rawW: number;
+  rawH: number;
+  isNormalizedCoords: boolean;
+}
+
+const DEFAULT_NUM_ANCHORS = 8400;
+const NUM_COCO_CLASSES = 80;
 const NUM_KEYPOINTS = 17;
 const MAX_POOL_PROPOSALS = 256;
 const MAX_TRACKS = 128;
+const INV_255 = 1 / 255.0;
 
-// Preallocated hot-path scratch buffers (zero GC pressure)
+// Buffers preasignados en el hilo Worklet (cero presión al Garbage Collector)
 const SORTED_INDICES = new Int32Array(MAX_POOL_PROPOSALS);
 const SUPPRESSED_FLAGS = new Uint8Array(MAX_POOL_PROPOSALS);
 const SIMILARITY_MATRIX = new Float32Array(MAX_TRACKS * MAX_POOL_PROPOSALS);
 const MATCHED_TRACK_FLAGS = new Uint8Array(MAX_TRACKS);
 const MATCHED_DET_FLAGS = new Uint8Array(MAX_POOL_PROPOSALS);
+const NORMALIZED_INPUT_SCRATCH = new Float32Array(640 * 640 * 3);
 
-function mapClassName(classId: UrbanClassId): UrbanClassName {
+/**
+ * Obtiene el nombre legible de cualquiera de las 80 clases de COCO.
+ */
+export function getCocoClassName(classId: number): string {
   'worklet';
-  switch (classId) {
-    case 0:
-      return 'person';
-    case 1:
-      return 'bicycle';
-    case 2:
-      return 'car';
-    case 5:
-      return 'bus';
+  if (classId >= 0 && classId < COCO_CLASS_NAMES.length) {
+    return COCO_CLASS_NAMES[classId];
   }
+  return `class_${classId}`;
 }
 
 /**
- * Preallocated object pool for YoloProposal instances so decoding 8,400 anchors
- * never allocates intermediate detection objects on the JS/Worklet heap.
+ * Clasifica cualquiera de las 80 clases de COCO en su categoría semántica visual.
+ */
+export function getSemanticCategory(classId: number): SemanticCategory {
+  'worklet';
+  if (classId === 0) return 'person';
+  if (classId === 1 || classId === 3) return 'bicycle'; // bicycle, motorcycle
+  if (
+    classId === 2 || // car
+    classId === 4 || // airplane
+    classId === 5 || // bus
+    classId === 6 || // train
+    classId === 7 || // truck
+    classId === 8    // boat
+  ) {
+    return 'vehicle';
+  }
+  if (classId >= 14 && classId <= 23) {
+    // bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe
+    return 'animal';
+  }
+  return 'object';
+}
+
+/**
+ * Punto Crítico 1: Normalización garantizada del Tensor de Entrada [0.0 .. 1.0].
+ *
+ * Si el modelo TFLite fue exportado en FP16 o FP32, espera floats en [0.0, 1.0].
+ * Cuando `vision-camera-resize-plugin` devuelve `Uint8Array` (0..255) o un `Float32Array`
+ * con valores sin escalar (0.0..255.0), el modelo se satura y produce confianza 0.000.
+ * Esta función verifica una muestra del buffer y normaliza a [0.0, 1.0] sin asignar memoria en el heap.
+ */
+export function ensureNormalizedFloat32Input(
+  rawBuffer: Float32Array | Uint8Array,
+  expectedDataType: string = 'float32'
+): { buffer: Float32Array | Uint8Array; wasRescaledFrom255: boolean } {
+  'worklet';
+  // Si el modelo es cuantizado INT8/UINT8 puro, respeta el buffer entero original
+  if (expectedDataType === 'uint8' || expectedDataType === 'int8') {
+    return { buffer: rawBuffer, wasRescaledFrom255: false };
+  }
+
+  const len = rawBuffer.length;
+  // Muestreamos varios píxeles distribuidos para detectar si el rango supera 1.0 (escala 0..255)
+  let needsRescale = !(rawBuffer instanceof Float32Array);
+  if (!needsRescale) {
+    const step = Math.max(1, Math.floor(len / 32));
+    for (let idx = 0; idx < len; idx += step) {
+      if (rawBuffer[idx] > 1.05) {
+        needsRescale = true;
+        break;
+      }
+    }
+  }
+
+  if (!needsRescale && rawBuffer instanceof Float32Array) {
+    return { buffer: rawBuffer, wasRescaledFrom255: false };
+  }
+
+  // Si ya es un Float32Array mutable con valores 0..255, normalizamos in-place o sobre buffer preasignado
+  const target =
+    rawBuffer instanceof Float32Array
+      ? rawBuffer
+      : NORMALIZED_INPUT_SCRATCH.length === len
+      ? NORMALIZED_INPUT_SCRATCH
+      : new Float32Array(len);
+
+  for (let i = 0; i < len; i++) {
+    target[i] = rawBuffer[i] * INV_255;
+  }
+
+  return { buffer: target, wasRescaledFrom255: true };
+}
+
+/**
+ * Punto Crítico 2: Detección dinámica del Layout del Tensor de Salida.
+ * - Ultralytics TFLite estándar: [1, 84, 8400] -> 'channels-first' (stride = 8400)
+ * - Exportaciones transpuestas:  [1, 8400, 84] -> 'anchors-first'  (stride = 84)
+ */
+export function resolveOutputTensorLayout(
+  tensorLength: number,
+  outputShape?: readonly number[],
+  defaultChannels = 84
+): {
+  layout: TensorOutputLayout;
+  numChannels: number;
+  numAnchors: number;
+} {
+  'worklet';
+  if (outputShape && outputShape.length >= 3) {
+    const d1 = outputShape[outputShape.length - 2];
+    const d2 = outputShape[outputShape.length - 1];
+    if (d1 > 0 && d2 > 0) {
+      if (d1 <= d2) {
+        return { layout: 'channels-first', numChannels: d1, numAnchors: d2 };
+      } else {
+        return { layout: 'anchors-first', numChannels: d2, numAnchors: d1 };
+      }
+    }
+  }
+
+  // Fallback por longitud total del Float32Array (ej. 84 * 8400 = 705,600)
+  const inferredAnchors = Math.round(tensorLength / defaultChannels) || DEFAULT_NUM_ANCHORS;
+  return {
+    layout: 'channels-first',
+    numChannels: defaultChannels,
+    numAnchors: inferredAnchors,
+  };
+}
+
+/**
+ * Pool preasignado de propuestas YOLO para que decodificar 8,400 anclas jamás
+ * cree objetos efímeros en el recolector de basura del Worklet.
  */
 export class ProposalPool {
   public readonly items: YoloProposal[];
@@ -119,6 +351,7 @@ export class ProposalPool {
       this.items[i] = {
         classId: 0,
         className: 'person',
+        category: 'person',
         confidence: 0,
         cx: 0,
         cy: 0,
@@ -148,152 +381,350 @@ const DEFAULT_DET_POOL = new ProposalPool(MAX_POOL_PROPOSALS);
 const DEFAULT_POSE_POOL = new ProposalPool(MAX_POOL_PROPOSALS);
 
 /**
- * 1A. Decodificador de Tensor de Detección YOLO ([1, 84, 8400])
- * Filtra únicamente las clases urbanas objetivo: 0 (person), 1 (bicycle), 2 (car), 5 (bus).
- * Devuelve el conteo válido escrito en `pool` (zero-allocation).
+ * Punto Crítico 6: Inspector de Diagnóstico Smoke Test (1 vez por segundo).
+ * Escanea el tensor de salida sin filtro de umbral para reportar el maxScore real,
+ * la clase ganadora y las coordenadas crudas [cx, cy, w, h].
+ */
+export function inspectYoloOutputTensor(
+  detTensor: Float32Array,
+  outputShape?: readonly number[]
+): TensorSmokeDiagnostic {
+  'worklet';
+  const { layout, numChannels, numAnchors } = resolveOutputTensorLayout(
+    detTensor.length,
+    outputShape,
+    84
+  );
+  const numClasses = Math.min(NUM_COCO_CLASSES, Math.max(1, numChannels - 4));
+
+  let maxScore = -Infinity;
+  let bestClassId = 0;
+  let bestAnchorIndex = 0;
+
+  if (layout === 'channels-first') {
+    for (let c = 0; c < numClasses; c++) {
+      const chOffset = (4 + c) * numAnchors;
+      for (let i = 0; i < numAnchors; i++) {
+        const s = detTensor[chOffset + i];
+        if (s > maxScore) {
+          maxScore = s;
+          bestClassId = c;
+          bestAnchorIndex = i;
+        }
+      }
+    }
+  } else {
+    for (let i = 0; i < numAnchors; i++) {
+      const rowOffset = i * numChannels;
+      for (let c = 0; c < numClasses; c++) {
+        const s = detTensor[rowOffset + 4 + c];
+        if (s > maxScore) {
+          maxScore = s;
+          bestClassId = c;
+          bestAnchorIndex = i;
+        }
+      }
+    }
+  }
+
+  let rawCx = 0;
+  let rawCy = 0;
+  let rawW = 0;
+  let rawH = 0;
+
+  if (layout === 'channels-first') {
+    rawCx = detTensor[0 * numAnchors + bestAnchorIndex];
+    rawCy = detTensor[1 * numAnchors + bestAnchorIndex];
+    rawW = detTensor[2 * numAnchors + bestAnchorIndex];
+    rawH = detTensor[3 * numAnchors + bestAnchorIndex];
+  } else {
+    const rowOffset = bestAnchorIndex * numChannels;
+    rawCx = detTensor[rowOffset + 0];
+    rawCy = detTensor[rowOffset + 1];
+    rawW = detTensor[rowOffset + 2];
+    rawH = detTensor[rowOffset + 3];
+  }
+
+  return {
+    layout,
+    numAnchors,
+    numChannels,
+    numClasses,
+    maxScore: maxScore === -Infinity ? 0 : maxScore,
+    bestClassId,
+    bestClassName: getCocoClassName(bestClassId),
+    bestAnchorIndex,
+    rawCx,
+    rawCy,
+    rawW,
+    rawH,
+    isNormalizedCoords: rawW <= 1.5 && rawH <= 1.5,
+  };
+}
+
+/**
+ * 1A. Decodificador Universal de Tensor de Detección YOLOv8 / YOLO11
+ * - Soporta dinámicamente layout [1, 84, 8400] ('channels-first') y [1, 8400, 84] ('anchors-first').
+ * - Evalúa las 80 clases completas de COCO (personas, vehículos, animales, objetos).
+ * - No aplica doble Sigmoid si los puntajes ya están en [0.0, 1.0] (aplica sigmoid solo si detecta logits crudos < 0 o > 1).
+ * - Detecta automáticamente si [cx, cy, w, h] ya vienen normalizadas en [0..1] (w <= 1.5) o en píxeles [0..640].
  */
 export function decodeYoloDetections(
   detTensor: Float32Array,
   confThreshold = 0.45,
   tensorSize = 640,
-  pool: ProposalPool = DEFAULT_DET_POOL
+  pool: ProposalPool = DEFAULT_DET_POOL,
+  outputShape?: readonly number[]
 ): ProposalPool {
   'worklet';
   pool.reset();
 
-  const ch0 = 0;
-  const ch1 = NUM_ANCHORS;
-  const ch2 = 2 * NUM_ANCHORS;
-  const ch3 = 3 * NUM_ANCHORS;
-
-  const chPerson = 4 * NUM_ANCHORS;
-  const chBicycle = 5 * NUM_ANCHORS;
-  const chCar = 6 * NUM_ANCHORS;
-  const chBus = 9 * NUM_ANCHORS;
-
+  const { layout, numChannels, numAnchors } = resolveOutputTensorLayout(
+    detTensor.length,
+    outputShape,
+    84
+  );
+  const numClasses = Math.min(NUM_COCO_CLASSES, Math.max(1, numChannels - 4));
   const invSize = 1 / tensorSize;
 
-  for (let i = 0; i < NUM_ANCHORS; i++) {
-    const sPerson = detTensor[chPerson + i];
-    const sBicycle = detTensor[chBicycle + i];
-    const sCar = detTensor[chCar + i];
-    const sBus = detTensor[chBus + i];
+  if (layout === 'channels-first') {
+    // Layout [1, 84, 8400]: lectura channel * 8400 + anchorIndex
+    const ch0 = 0;
+    const ch1 = numAnchors;
+    const ch2 = 2 * numAnchors;
+    const ch3 = 3 * numAnchors;
 
-    let bestScore = confThreshold;
-    let bestCls: UrbanClassId | -1 = -1;
+    for (let i = 0; i < numAnchors; i++) {
+      let bestScore = confThreshold;
+      let bestCls = -1;
 
-    if (sPerson >= bestScore) {
-      bestScore = sPerson;
-      bestCls = 0;
+      for (let c = 0; c < numClasses; c++) {
+        let score = detTensor[(4 + c) * numAnchors + i];
+        // Punto Crítico 5: Jamás aplicar doble Sigmoid si el valor ya está en [0.0, 1.0].
+        // Solo si el modelo devolvió logits crudos fuera de [0, 1] (> 1.001), aplicamos sigmoid.
+        if (score > 1.001) {
+          score = 1 / (1 + Math.exp(-score));
+        }
+        if (score >= bestScore) {
+          bestScore = score;
+          bestCls = c;
+        }
+      }
+
+      if (bestCls === -1) continue;
+
+      const slot = pool.acquire();
+      if (!slot) break;
+
+      let cx = detTensor[ch0 + i];
+      let cy = detTensor[ch1 + i];
+      let w = detTensor[ch2 + i];
+      let h = detTensor[ch3 + i];
+
+      // Punto Crítico 3: Ultralytics TFLite suele exportar [cx, cy, w, h] ya normalizadas en [0..1].
+      // Solo dividimos entre 640 si detectamos escala en píxeles (w > 1.5 o h > 1.5).
+      if (w > 1.5 || h > 1.5 || cx > 1.5 || cy > 1.5) {
+        cx *= invSize;
+        cy *= invSize;
+        w *= invSize;
+        h *= invSize;
+      }
+
+      slot.classId = bestCls;
+      slot.className = getCocoClassName(bestCls);
+      slot.category = getSemanticCategory(bestCls);
+      slot.confidence = bestScore;
+      slot.cx = cx;
+      slot.cy = cy;
+      slot.w = w;
+      slot.h = h;
+      slot.hasPose = false;
     }
-    if (sBicycle > bestScore) {
-      bestScore = sBicycle;
-      bestCls = 1;
+  } else {
+    // Layout transpuesto [1, 8400, 84]: lectura anchorIndex * 84 + channel
+    for (let i = 0; i < numAnchors; i++) {
+      const rowOffset = i * numChannels;
+      let bestScore = confThreshold;
+      let bestCls = -1;
+
+      for (let c = 0; c < numClasses; c++) {
+        let score = detTensor[rowOffset + 4 + c];
+        if (score > 1.001) {
+          score = 1 / (1 + Math.exp(-score));
+        }
+        if (score >= bestScore) {
+          bestScore = score;
+          bestCls = c;
+        }
+      }
+
+      if (bestCls === -1) continue;
+
+      const slot = pool.acquire();
+      if (!slot) break;
+
+      let cx = detTensor[rowOffset + 0];
+      let cy = detTensor[rowOffset + 1];
+      let w = detTensor[rowOffset + 2];
+      let h = detTensor[rowOffset + 3];
+
+      if (w > 1.5 || h > 1.5 || cx > 1.5 || cy > 1.5) {
+        cx *= invSize;
+        cy *= invSize;
+        w *= invSize;
+        h *= invSize;
+      }
+
+      slot.classId = bestCls;
+      slot.className = getCocoClassName(bestCls);
+      slot.category = getSemanticCategory(bestCls);
+      slot.confidence = bestScore;
+      slot.cx = cx;
+      slot.cy = cy;
+      slot.w = w;
+      slot.h = h;
+      slot.hasPose = false;
     }
-    if (sCar > bestScore) {
-      bestScore = sCar;
-      bestCls = 2;
-    }
-    if (sBus > bestScore) {
-      bestScore = sBus;
-      bestCls = 5;
-    }
-
-    if (bestCls === -1) continue;
-
-    const slot = pool.acquire();
-    if (!slot) break;
-
-    let cx = detTensor[ch0 + i];
-    let cy = detTensor[ch1 + i];
-    let w = detTensor[ch2 + i];
-    let h = detTensor[ch3 + i];
-
-    // Normalizar a [0..1] si el export devolvió escala en píxeles [0..640]
-    if (cx > 1.5 || cy > 1.5 || w > 1.5 || h > 1.5) {
-      cx *= invSize;
-      cy *= invSize;
-      w *= invSize;
-      h *= invSize;
-    }
-
-    slot.classId = bestCls;
-    slot.className = mapClassName(bestCls);
-    slot.confidence = bestScore;
-    slot.cx = cx;
-    slot.cy = cy;
-    slot.w = w;
-    slot.h = h;
-    slot.hasPose = false;
   }
 
   return pool;
 }
 
 /**
- * 1B. Decodificador de Tensor de Pose YOLO ([1, 56, 8400])
+ * 1B. Decodificador de Tensor de Pose YOLO ([1, 56, 8400] o [1, 8400, 56])
  * Extrae cajas de personas junto con sus 17 keypoints COCO ([x, y, visibility]).
  */
 export function decodeYoloPose(
   poseTensor: Float32Array,
   confThreshold = 0.45,
   tensorSize = 640,
-  pool: ProposalPool = DEFAULT_POSE_POOL
+  pool: ProposalPool = DEFAULT_POSE_POOL,
+  outputShape?: readonly number[]
 ): ProposalPool {
   'worklet';
   pool.reset();
 
-  const ch0 = 0;
-  const ch1 = NUM_ANCHORS;
-  const ch2 = 2 * NUM_ANCHORS;
-  const ch3 = 3 * NUM_ANCHORS;
-  const chConf = 4 * NUM_ANCHORS;
+  const { layout, numChannels, numAnchors } = resolveOutputTensorLayout(
+    poseTensor.length,
+    outputShape,
+    56
+  );
   const invSize = 1 / tensorSize;
 
-  for (let i = 0; i < NUM_ANCHORS; i++) {
-    const score = poseTensor[chConf + i];
-    if (score < confThreshold) continue;
+  if (layout === 'channels-first') {
+    const ch0 = 0;
+    const ch1 = numAnchors;
+    const ch2 = 2 * numAnchors;
+    const ch3 = 3 * numAnchors;
+    const chConf = 4 * numAnchors;
 
-    const slot = pool.acquire();
-    if (!slot) break;
+    for (let i = 0; i < numAnchors; i++) {
+      let score = poseTensor[chConf + i];
+      if (score > 1.001) {
+        score = 1 / (1 + Math.exp(-score));
+      }
+      if (score < confThreshold) continue;
 
-    let cx = poseTensor[ch0 + i];
-    let cy = poseTensor[ch1 + i];
-    let w = poseTensor[ch2 + i];
-    let h = poseTensor[ch3 + i];
+      const slot = pool.acquire();
+      if (!slot) break;
 
-    const isPixelScale = cx > 1.5 || cy > 1.5 || w > 1.5 || h > 1.5;
-    if (isPixelScale) {
-      cx *= invSize;
-      cy *= invSize;
-      w *= invSize;
-      h *= invSize;
-    }
+      let cx = poseTensor[ch0 + i];
+      let cy = poseTensor[ch1 + i];
+      let w = poseTensor[ch2 + i];
+      let h = poseTensor[ch3 + i];
 
-    slot.classId = 0;
-    slot.className = 'person';
-    slot.confidence = score;
-    slot.cx = cx;
-    slot.cy = cy;
-    slot.w = w;
-    slot.h = h;
-    slot.hasPose = true;
-
-    for (let k = 0; k < NUM_KEYPOINTS; k++) {
-      const baseChannel = (5 + k * 3) * NUM_ANCHORS;
-      let kx = poseTensor[baseChannel + i];
-      let ky = poseTensor[baseChannel + NUM_ANCHORS + i];
-      const kv = poseTensor[baseChannel + 2 * NUM_ANCHORS + i];
-
-      if (isPixelScale || kx > 1.5 || ky > 1.5) {
-        kx *= invSize;
-        ky *= invSize;
+      const isPixelScale = w > 1.5 || h > 1.5 || cx > 1.5 || cy > 1.5;
+      if (isPixelScale) {
+        cx *= invSize;
+        cy *= invSize;
+        w *= invSize;
+        h *= invSize;
       }
 
-      const kp = slot.keypoints[k];
-      kp.x = kx;
-      kp.y = ky;
-      kp.visibility = kv;
+      slot.classId = 0;
+      slot.className = 'person';
+      slot.category = 'person';
+      slot.confidence = score;
+      slot.cx = cx;
+      slot.cy = cy;
+      slot.w = w;
+      slot.h = h;
+      slot.hasPose = true;
+
+      for (let k = 0; k < NUM_KEYPOINTS; k++) {
+        const baseChannel = (5 + k * 3) * numAnchors;
+        let kx = poseTensor[baseChannel + i];
+        let ky = poseTensor[baseChannel + numAnchors + i];
+        let kv = poseTensor[baseChannel + 2 * numAnchors + i];
+
+        if (kv > 1.001 || kv < -0.001) {
+          kv = 1 / (1 + Math.exp(-kv));
+        }
+        if (isPixelScale || kx > 1.5 || ky > 1.5) {
+          kx *= invSize;
+          ky *= invSize;
+        }
+
+        const kp = slot.keypoints[k];
+        kp.x = kx;
+        kp.y = ky;
+        kp.visibility = kv;
+      }
+    }
+  } else {
+    for (let i = 0; i < numAnchors; i++) {
+      const rowOffset = i * numChannels;
+      let score = poseTensor[rowOffset + 4];
+      if (score > 1.001) {
+        score = 1 / (1 + Math.exp(-score));
+      }
+      if (score < confThreshold) continue;
+
+      const slot = pool.acquire();
+      if (!slot) break;
+
+      let cx = poseTensor[rowOffset + 0];
+      let cy = poseTensor[rowOffset + 1];
+      let w = poseTensor[rowOffset + 2];
+      let h = poseTensor[rowOffset + 3];
+
+      const isPixelScale = w > 1.5 || h > 1.5 || cx > 1.5 || cy > 1.5;
+      if (isPixelScale) {
+        cx *= invSize;
+        cy *= invSize;
+        w *= invSize;
+        h *= invSize;
+      }
+
+      slot.classId = 0;
+      slot.className = 'person';
+      slot.category = 'person';
+      slot.confidence = score;
+      slot.cx = cx;
+      slot.cy = cy;
+      slot.w = w;
+      slot.h = h;
+      slot.hasPose = true;
+
+      for (let k = 0; k < NUM_KEYPOINTS; k++) {
+        const kpBase = rowOffset + 5 + k * 3;
+        let kx = poseTensor[kpBase];
+        let ky = poseTensor[kpBase + 1];
+        let kv = poseTensor[kpBase + 2];
+
+        if (kv > 1.001 || kv < -0.001) {
+          kv = 1 / (1 + Math.exp(-kv));
+        }
+        if (isPixelScale || kx > 1.5 || ky > 1.5) {
+          kx *= invSize;
+          ky *= invSize;
+        }
+
+        const kp = slot.keypoints[k];
+        kp.x = kx;
+        kp.y = ky;
+        kp.visibility = kv;
+      }
     }
   }
 
@@ -365,8 +796,8 @@ export function calculateIoU(a: ScreenRect, b: ScreenRect): number {
 
 /**
  * 2C. Class-Aware Non-Maximum Suppression (NMS) sobre un ProposalPool.
- * Suprime únicamente duplicados dentro de la misma clase (una persona frente
- * a un automóvil jamás es suprimida). Escribe los índices sobrevivientes en `outKeptIndices`.
+ * Suprime únicamente duplicados dentro de la misma clase (ej. una persona con un perro
+ * o frente a un vehículo jamás se suprimen entre sí).
  */
 export function applyClassAwareNMS(
   pool: ProposalPool,
@@ -382,7 +813,6 @@ export function applyClassAwareNMS(
 
   const items = pool.items;
 
-  // Inicializar índices y flags de supresión sin crear arrays
   for (let i = 0; i < n; i++) {
     SORTED_INDICES[i] = i;
     SUPPRESSED_FLAGS[i] = 0;
@@ -413,7 +843,6 @@ export function applyClassAwareNMS(
       if (SUPPRESSED_FLAGS[j] === 1) continue;
 
       const other = items[SORTED_INDICES[j]];
-      // Aislamiento por clase (Class-Aware)
       if (other.classId !== cand.classId) continue;
 
       const iou = calculateIoUCenter(
@@ -437,9 +866,9 @@ export function applyClassAwareNMS(
 }
 
 /**
- * 4. Proyección Inversa Letterbox (projectToScreen)
- * Convierte coordenadas normalizadas [0..1] del tensor cuadrado 640x640 (con bandas negras
- * de relleno padding) a píxeles exactos de pantalla [x, y, width, height].
+ * 4. Proyección del Tensor 640x640 a Coordenadas Exactas de Pantalla (projectToScreen)
+ * Soporta tanto redimensionado directo de vision-camera-resize-plugin ('stretch')
+ * como preprocesamiento con bandas negras ('letterbox'), además de rotación de sensor.
  */
 export function projectToScreen(
   normCx: number,
@@ -453,32 +882,45 @@ export function projectToScreen(
   const tensorSize = params.tensorSize ?? 640;
   const orientation = params.orientation ?? 0;
   const resizeMode = params.resizeMode ?? 'cover';
+  const inputPaddingMode = params.inputPaddingMode ?? 'stretch';
   const isFrontCamera = params.isFrontCamera ?? false;
 
-  // Dimensiones efectivas del fotograma tras orientación del sensor
+  // Si la coordenada entró en píxeles [0..640] por error externo, la llevamos a [0..1]
+  const nCx = normCx > 1.5 ? normCx / tensorSize : normCx;
+  const nCy = normCy > 1.5 ? normCy / tensorSize : normCy;
+  const nW = normW > 1.5 ? normW / tensorSize : normW;
+  const nH = normH > 1.5 ? normH / tensorSize : normH;
+
+  // Dimensiones efectivas del fotograma tras orientación del sensor en VisionCamera v4
   const isRotated90or270 = orientation === 90 || orientation === 270;
-  const frameW = isRotated90or270 ? params.cameraHeight : params.cameraWidth;
-  const frameH = isRotated90or270 ? params.cameraWidth : params.cameraHeight;
+  const frameW = Math.max(1, isRotated90or270 ? params.cameraHeight : params.cameraWidth);
+  const frameH = Math.max(1, isRotated90or270 ? params.cameraWidth : params.cameraHeight);
 
-  // 1. Parámetros del padding letterbox en el tensor 640x640
-  const lbScale = Math.min(tensorSize / frameW, tensorSize / frameH);
-  const padX = (tensorSize - frameW * lbScale) * 0.5;
-  const padY = (tensorSize - frameH * lbScale) * 0.5;
+  let camCx = 0;
+  let camCy = 0;
+  let camW = 0;
+  let camH = 0;
 
-  // 2. Deshacer normalización [0..1] -> píxeles tensor -> píxeles cámara original
-  const tensorCx = normCx * tensorSize;
-  const tensorCy = normCy * tensorSize;
-  const tensorW = normW * tensorSize;
-  const tensorH = normH * tensorSize;
+  if (inputPaddingMode === 'letterbox') {
+    const lbScale = Math.min(tensorSize / frameW, tensorSize / frameH);
+    const padX = (tensorSize - frameW * lbScale) * 0.5;
+    const padY = (tensorSize - frameH * lbScale) * 0.5;
 
-  const camCx = (tensorCx - padX) / lbScale;
-  const camCy = (tensorCy - padY) / lbScale;
-  const camW = tensorW / lbScale;
-  const camH = tensorH / lbScale;
+    camCx = (nCx * tensorSize - padX) / lbScale;
+    camCy = (nCy * tensorSize - padY) / lbScale;
+    camW = (nW * tensorSize) / lbScale;
+    camH = (nH * tensorSize) / lbScale;
+  } else {
+    // 'stretch': vision-camera-resize-plugin mapea [0..1] del tensor directamente a [0..frameW/H]
+    camCx = nCx * frameW;
+    camCy = nCy * frameH;
+    camW = nW * frameW;
+    camH = nH * frameH;
+  }
 
-  // 3. Mapear del espacio de cámara al componente de pantalla (cover / contain)
-  const screenW = params.screenWidth;
-  const screenH = params.screenHeight;
+  // Mapear del espacio de cámara al componente de pantalla (cover / contain)
+  const screenW = Math.max(1, params.screenWidth);
+  const screenH = Math.max(1, params.screenHeight);
   const viewScale =
     resizeMode === 'cover'
       ? Math.max(screenW / frameW, screenH / frameH)
@@ -517,21 +959,32 @@ export function projectPointToScreen(
   const tensorSize = params.tensorSize ?? 640;
   const orientation = params.orientation ?? 0;
   const resizeMode = params.resizeMode ?? 'cover';
+  const inputPaddingMode = params.inputPaddingMode ?? 'stretch';
   const isFrontCamera = params.isFrontCamera ?? false;
 
+  const nX = normX > 1.5 ? normX / tensorSize : normX;
+  const nY = normY > 1.5 ? normY / tensorSize : normY;
+
   const isRotated90or270 = orientation === 90 || orientation === 270;
-  const frameW = isRotated90or270 ? params.cameraHeight : params.cameraWidth;
-  const frameH = isRotated90or270 ? params.cameraWidth : params.cameraHeight;
+  const frameW = Math.max(1, isRotated90or270 ? params.cameraHeight : params.cameraWidth);
+  const frameH = Math.max(1, isRotated90or270 ? params.cameraWidth : params.cameraHeight);
 
-  const lbScale = Math.min(tensorSize / frameW, tensorSize / frameH);
-  const padX = (tensorSize - frameW * lbScale) * 0.5;
-  const padY = (tensorSize - frameH * lbScale) * 0.5;
+  let camX = 0;
+  let camY = 0;
 
-  const camX = (normX * tensorSize - padX) / lbScale;
-  const camY = (normY * tensorSize - padY) / lbScale;
+  if (inputPaddingMode === 'letterbox') {
+    const lbScale = Math.min(tensorSize / frameW, tensorSize / frameH);
+    const padX = (tensorSize - frameW * lbScale) * 0.5;
+    const padY = (tensorSize - frameH * lbScale) * 0.5;
+    camX = (nX * tensorSize - padX) / lbScale;
+    camY = (nY * tensorSize - padY) / lbScale;
+  } else {
+    camX = nX * frameW;
+    camY = nY * frameH;
+  }
 
-  const screenW = params.screenWidth;
-  const screenH = params.screenHeight;
+  const screenW = Math.max(1, params.screenWidth);
+  const screenH = Math.max(1, params.screenHeight);
   const viewScale =
     resizeMode === 'cover'
       ? Math.max(screenW / frameW, screenH / frameH)
@@ -552,9 +1005,9 @@ export function projectPointToScreen(
 }
 
 /**
- * 3. Rastreador Ligero Multi-Objeto (SimpleByteTracker)
+ * 3. Rastreador Ligero Multi-Objeto para las 80 clases de COCO (SimpleByteTracker)
  * Inspirado en ByteTrack / SORT con matriz de similitud (IoU + proximidad de centroide),
- * retención temporal (maxLostFrames = 15) y cálculo de deltas por categoría (+1, -1, 0).
+ * retención temporal (maxLostFrames = 15) y cálculo de deltas por categoría.
  */
 export class SimpleByteTracker {
   private nextTrackId = 1;
@@ -563,10 +1016,10 @@ export class SimpleByteTracker {
   private readonly similarityThreshold: number;
   private readonly highConfThreshold: number;
 
-  private prevCounts = { persons: 0, vehicles: 0, bicycles: 0 };
-  private currentCounts = { persons: 0, vehicles: 0, bicycles: 0 };
+  private prevCounts = { persons: 0, vehicles: 0, bicycles: 0, animals: 0, objects: 0 };
+  private currentCounts = { persons: 0, vehicles: 0, bicycles: 0, animals: 0, objects: 0 };
 
-  constructor(maxLostFrames = 15, similarityThreshold = 0.28, highConfThreshold = 0.52) {
+  constructor(maxLostFrames = 15, similarityThreshold = 0.28, highConfThreshold = 0.42) {
     this.maxLostFrames = maxLostFrames;
     this.similarityThreshold = similarityThreshold;
     this.highConfThreshold = highConfThreshold;
@@ -576,14 +1029,10 @@ export class SimpleByteTracker {
     'worklet';
     this.nextTrackId = 1;
     this.tracks.length = 0;
-    this.prevCounts = { persons: 0, vehicles: 0, bicycles: 0 };
-    this.currentCounts = { persons: 0, vehicles: 0, bicycles: 0 };
+    this.prevCounts = { persons: 0, vehicles: 0, bicycles: 0, animals: 0, objects: 0 };
+    this.currentCounts = { persons: 0, vehicles: 0, bicycles: 0, animals: 0, objects: 0 };
   }
 
-  /**
-   * Actualiza los tracks con las detecciones filtradas por NMS y proyectadas a pantalla.
-   * Reutiliza la matriz de similitud preasignada para mantener latencia < 0.3 ms.
-   */
   public update(
     pool: ProposalPool,
     keptIndices: Int32Array,
@@ -598,7 +1047,7 @@ export class SimpleByteTracker {
     for (let t = 0; t < numTracks; t++) MATCHED_TRACK_FLAGS[t] = 0;
     for (let d = 0; d < numDets; d++) MATCHED_DET_FLAGS[d] = 0;
 
-    // 1. Proyectar detecciones sobrevivientes de NMS a espacio de pantalla (en slots temporales)
+    // 1. Proyectar detecciones sobrevivientes de NMS a espacio de pantalla
     const detRects = new Array<ScreenRect>(numDets);
     for (let d = 0; d < numDets; d++) {
       const prop = pool.items[keptIndices[d]];
@@ -628,7 +1077,7 @@ export class SimpleByteTracker {
       }
     }
 
-    // 3. Asociación greedy en 2 etapas (alta confianza primero, recuperación después)
+    // 3. Asociación greedy en 2 etapas
     for (let pass = 0; pass < 2; pass++) {
       const minConf = pass === 0 ? this.highConfThreshold : 0;
 
@@ -681,7 +1130,7 @@ export class SimpleByteTracker {
       }
     }
 
-    // 4. Envejecer tracks no emparejados y podar los que superen maxLostFrames = 15
+    // 4. Envejecer tracks no emparejados y podar los que superen maxLostFrames
     const nextTracks: TrackedObject[] = [];
     for (let t = 0; t < numTracks; t++) {
       const tr = this.tracks[t];
@@ -695,11 +1144,10 @@ export class SimpleByteTracker {
       }
     }
 
-    // 5. Crear nuevos tracks para detecciones de alta confianza sin emparejar
+    // 5. Crear nuevos tracks para todas las detecciones válidas que sobrevivieron NMS
     for (let d = 0; d < numDets; d++) {
       if (MATCHED_DET_FLAGS[d] === 1) continue;
       const prop = pool.items[keptIndices[d]];
-      if (prop.confidence < this.highConfThreshold) continue;
 
       const rect = detRects[d];
       const kps = new Array<PoseKeypoint>(NUM_KEYPOINTS);
@@ -715,6 +1163,7 @@ export class SimpleByteTracker {
         trackId: this.nextTrackId++,
         classId: prop.classId,
         className: prop.className,
+        category: prop.category,
         confidence: prop.confidence,
         screenBox: rect,
         keypoints: kps,
@@ -732,35 +1181,36 @@ export class SimpleByteTracker {
     let persons = 0;
     let vehicles = 0;
     let bicycles = 0;
+    let animals = 0;
+    let objects = 0;
+
     for (let i = 0; i < this.tracks.length; i++) {
       const tr = this.tracks[i];
       if (tr.lostFrames > 0) continue;
-      if (tr.classId === 0) persons++;
-      else if (tr.classId === 2 || tr.classId === 5) vehicles++;
-      else if (tr.classId === 1) bicycles++;
+      if (tr.category === 'person') persons++;
+      else if (tr.category === 'vehicle') vehicles++;
+      else if (tr.category === 'bicycle') bicycles++;
+      else if (tr.category === 'animal') animals++;
+      else objects++;
     }
 
-    this.currentCounts = { persons, vehicles, bicycles };
+    this.currentCounts = { persons, vehicles, bicycles, animals, objects };
     return this.tracks;
   }
 
-  /**
-   * Calcula y confirma el delta (+1, -1, 0) respecto al intervalo anterior
-   * para alimentar las tarjetas de Personas, Vehículos y Bicicletas.
-   */
   public commitIntervalDeltas(): CategoryDeltaSnapshot {
     'worklet';
     const snapshot: CategoryDeltaSnapshot = {
       persons: this.currentCounts.persons,
       vehicles: this.currentCounts.vehicles,
       bicycles: this.currentCounts.bicycles,
+      animals: this.currentCounts.animals,
+      objects: this.currentCounts.objects,
       deltaPersons: this.currentCounts.persons - this.prevCounts.persons,
       deltaVehicles: this.currentCounts.vehicles - this.prevCounts.vehicles,
       deltaBicycles: this.currentCounts.bicycles - this.prevCounts.bicycles,
     };
-    this.prevCounts.persons = this.currentCounts.persons;
-    this.prevCounts.vehicles = this.currentCounts.vehicles;
-    this.prevCounts.bicycles = this.currentCounts.bicycles;
+    this.prevCounts = { ...this.currentCounts };
     return snapshot;
   }
 }
