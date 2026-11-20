@@ -16,6 +16,9 @@ import humanSafetyAnalyticsRaw from '../modules/HumanSafetyAnalytics.ts?raw';
 import mobileAssistantSuiteRaw from '../modules/MobileAssistantSuite.ts?raw';
 import arCanvasRenderWorkerRaw from '../workers/arCanvasRenderWorker.ts?raw';
 import arOverlayRendererCoreRaw from '../workers/arOverlayRendererCore.ts?raw';
+import arBinaryProtocolRaw from '../rendering/arBinaryProtocol.ts?raw';
+import arCanvasRendererRaw from '../rendering/arCanvasRenderer.ts?raw';
+import arRenderWorkerRaw from '../workers/ARRenderWorker.ts?raw';
 import exportOnnxWebColabRaw from '../../scripts/export_onnx_web_colab.py?raw';
 
 export type DeliverableCategory = 'project' | 'inference' | 'ui' | 'native' | 'colab';
@@ -34,18 +37,22 @@ export interface CodeFileNode {
 export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 ├── src/
 │   ├── App.tsx                              # Visor AR ONNX + Radar Vehicular + ROI + REC Video + Voz + GPS
+│   ├── rendering/
+│   │   ├── arBinaryProtocol.ts              # Empaquetador Binario Zero-Copy (Float32Array + Transferable Objects)
+│   │   └── arCanvasRenderer.ts              # Motor 2D Agnóstico (0% shadowBlur + Doble Trazo Neón + Lupa Táctica)
 │   ├── workers/
-│   │   ├── arCanvasRenderWorker.ts          # Dedicated Web Worker con OffscreenCanvas (60/120 FPS fuera del Main Thread)
+│   │   ├── ARRenderWorker.ts                # Web Worker 60 FPS (OffscreenCanvas + Zero-Copy ArrayBuffer Decoder)
+│   │   ├── arCanvasRenderWorker.ts          # Worker de Compatibilidad Extendida
 │   │   └── arOverlayRendererCore.ts         # Motor Puro 2D AR + Kalman 1D + LERP + Caché LRU de measureText()
 │   ├── modules/
 │   │   ├── EvidenceAndReportsModule.ts      # Photo-Multa AR (Canvas Crop + Cintillo) + IndexedDB Circular + CSV
-│   │   ├── SpatialZonesROI.ts               # Polígono ROI 4 Vértices (Ray-Casting) + ALPR Tesseract.js Web Worker
+│   │   ├── SpatialZonesROI.ts               # Polígono ROI 4 Vértices (Ray-Casting + Snapping) + ALPR Tesseract.js
 │   │   ├── HumanSafetyAnalytics.ts          # Detección de Caídas 17kp (>2.5s) + Riesgo Colisión Peatón-Vehículo
 │   │   └── MobileAssistantSuite.ts          # Asistente Voz (Web Speech ES) + GPS Dashcam + Grabador Video AR 30FPS
 │   ├── components/
 │   │   ├── ARStartOverlay.tsx               # Botón flotante "Iniciar Cámara AR" + Permisos iOS 13+ IMU/WebRTC
 │   │   ├── WebCameraStream.tsx              # getUserMedia progresivo + playsInline Safari/Samsung + Switch Cam
-│   │   ├── ARWebCanvasOverlay.tsx           # Puente OffscreenCanvas + WeakMap StrictMode + Sync Inercial Kalman
+│   │   ├── ARWebCanvasOverlay.tsx           # Puente OffscreenCanvas + Fallback Transparente REC + Capa Táctil 60Hz
 │   │   ├── AROverlayCanvas.tsx              # Skia AR Full-Screen (React Native) + LERP + 60Hz Gyro Offset
 │   │   ├── DetectionOverlayCanvas.tsx       # Skia PictureRecorder 60 FPS (cero re-renders)
 │   │   └── DiagnosticsModal.tsx             # Centro de Comando: Telemetría, Galería Evidencias/CSV, ROI/ALPR/GPS/Voz
@@ -76,6 +83,48 @@ export const RN_PROJECT_TREE = `VisionEdge-ONNX-Web-And-RN/
 └── vite.config.ts                           # Configuración MIME/CORS para servir .onnx y .wasm sin errores`;
 
 export const RN_ARCHITECTURE_FILES: CodeFileNode[] = [
+  {
+    id: 'ar-binary-protocol',
+    path: 'src/rendering/arBinaryProtocol.ts',
+    name: 'arBinaryProtocol.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Protocolo Binario Zero-Copy para Transferencia de Detecciones AR (Main Thread -> Web Worker): empaqueta todas las detecciones activas (trackId, classId, cajas, velocidad km/h, banderas de estado, 17 keypoints y 15 puntos de estela) en un Float32Array plano (Stride=99 floats) y transfiere el ArrayBuffer mediante Transferable Objects (< 0.05 ms).',
+    highlights: [
+      'Stride fijo de 99 valores Float32 por detección (396 bytes) sin serialización de grafos JSON profundos',
+      'Transferencia Zero-Copy del ArrayBuffer mediante worker.postMessage({ type: "FRAME_DATA", buffer, meta }, [buffer])',
+      'Decodificación instantánea en el Worker lista para interpolación lineal (LERP) y Kalman 1D a 60 FPS',
+    ],
+    content: arBinaryProtocolRaw,
+  },
+  {
+    id: 'ar-canvas-renderer',
+    path: 'src/rendering/arCanvasRenderer.ts',
+    name: 'arCanvasRenderer.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Motor de Dibujo AR Agnóstico del Contexto (OffscreenCanvasRenderingContext2D y CanvasRenderingContext2D): elimina el 100% de llamadas a ctx.shadowBlur reemplazándolas por la técnica de Doble Trazo Neón (halo exterior globalAlpha=0.25 + trazo interior nítido de 2px), interpola posiciones a 60 FPS con LERP + Kalman 1D y dibuja una Lupa Táctica de Precisión durante el arrastre de vértices ROI.',
+    highlights: [
+      'Técnica de Doble Trazo Neón (strokeDoubleNeonSegment / strokeDoubleNeonPolygon) para 60 FPS constantes en GPUs móviles iOS/Android',
+      'Renderizado completo de las 6 capas AR: Retículas, Estelas, Callout Pins (km/h + ALPR), Esqueleto 17kp, Aforo y Polígono ROI con Snapping',
+      'Lupa Táctica de Precisión (drawTacticalTouchLoupe) con ampliación óptica 1.8x y mira milimétrica al arrastrar V1..V4 o A/B',
+    ],
+    content: arCanvasRendererRaw,
+  },
+  {
+    id: 'ar-render-worker',
+    path: 'src/workers/ARRenderWorker.ts',
+    name: 'ARRenderWorker.ts',
+    language: 'typescript',
+    deliverable: 'ui',
+    summary: 'Dedicated Web Worker de Renderizado AR a 60 FPS (src/workers/ARRenderWorker.ts): recibe el OffscreenCanvas inicial, configura HiDPI (devicePixelRatio), ejecuta su propio bucle requestAnimationFrame a 60 FPS y procesa mensajes INIT_CANVAS, RESIZE, FRAME_DATA (Zero-Copy ArrayBuffer), ROI_UPDATE, POINTER_DRAG y THEME_CHANGE.',
+    highlights: [
+      'Bucle requestAnimationFrame autónomo a 60 FPS dentro del Worker desacoplado de la inferencia ONNX (~25-30 FPS)',
+      'Recepción Zero-Copy de FRAME_DATA decodificando el ArrayBuffer transferido con decodeDetectionsFromBinaryBuffer',
+      'Respuesta instantánea a 60Hz ante eventos POINTER_DRAG / ROI_UPDATE con guías magnéticas y Lupa Táctica de Precisión',
+    ],
+    content: arRenderWorkerRaw,
+  },
   {
     id: 'ar-canvas-render-worker',
     path: 'src/workers/arCanvasRenderWorker.ts',

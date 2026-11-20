@@ -740,6 +740,7 @@ export default function App() {
         lineEndpointsNorm={lineEndpointsNorm}
         activeDragHandle={activeDragHandle}
         enableRoiPolygon={enableRoiPolygonActive}
+        enableRoiSnapping={enableRoiSnappingActive}
         roiVerticesNorm={roiVerticesNorm}
         activeRoiVertexIndex={activeRoiVertexIndex}
         activeRoiViolationInView={trafficTelemetry.activeRoiViolationInView}
@@ -749,10 +750,20 @@ export default function App() {
         heatmapPoints={heatmapPoints}
         screenWidth={viewportSize.width}
         screenHeight={viewportSize.height}
+        isRecordingAR={recorderStatus.isRecording}
         inertialStateRef={inertialStateRef}
         computeAnchoredDetectionState={computeAnchoredDetectionState}
         decayInertialOffsetOnRenderFrame={decayInertialOffsetOnRenderFrame}
         onCanvasReady={setArOverlayCanvas}
+        onRoiVerticesChange={(vertices, guides, activeIdx) => {
+          setRoiVerticesNorm(vertices);
+          setRoiSnapGuides(guides);
+          setActiveRoiVertexIndex(activeIdx);
+        }}
+        onCountingLineChange={(endpoints, activeHandle) => {
+          setLineEndpointsNorm(endpoints);
+          setActiveDragHandle(activeHandle);
+        }}
       />
 
       {/* 3. Pantalla Inicial Inmersiva con Botón Flotante "Iniciar Cámara AR" */}
